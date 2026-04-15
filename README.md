@@ -99,30 +99,85 @@ Test coverage:
 
 ---
 
-## Integration with the motion planner / simulator
+## Integration with PyBullet and RRT motion planning
+
+### Quick start
+
+Run a demo scenario with the Franka Panda arm:
+
+```bash
+# Activate your virtual environment first
+source .venv/bin/activate
+
+# Run a scenario (simple, moderate, or corridor)
+python examples/franka_pybullet_demo.py --scenario simple
+python examples/franka_pybullet_demo.py --scenario moderate
+python examples/franka_pybullet_demo.py --scenario corridor
+```
+
+This launches a PyBullet simulation that:
+1. Creates obstacles in the workspace
+2. Reshapes them into disjoint star-shaped proxies using Algorithm 2
+3. Plans a collision-free path using RRT
+4. Executes the path on the Franka Panda arm
+
+### How the integration works
+
+The integration follows a **2D planning + 3D execution** approach:
+
+1. **Obstacle modeling** — Obstacles are represented as ellipses in the X-Y plane (star-worlds is 2D-only). Each obstacle includes a safety margin for collision avoidance.
+
+2. **Star-world reshaping** — `StarWorldUpdater` reshapes overlapping obstacles into disjoint star-shaped proxies that preserve collision-free space while enabling convergence guarantees for motion planners.
+
+3. **2D path planning** — RRT searches for a path in the 2D workspace (X-Y projection) using the proxy obstacles for collision checking. This produces waypoints `[(x₁, y₁), (x₂, y₂), ...]`.
+
+4. **3D trajectory execution** — The 2D waypoints are lifted to 3D by interpolating Z-heights between start and goal. Inverse kinematics maps each 3D waypoint to joint angles for the Franka arm.
+
+### Basic API usage
 
 ```python
-from starworlds import StarWorldUpdater, Ellipse, ConvexPolygon2D
-import numpy as np
+from starworlds import StarWorldUpdater, Ellipse
+from starworlds.rrt_planner import RRTPlanner
 
-updater = StarWorldUpdater(L=1e4)   # L should be ~10× your workspace radius
+# Initialize star-world updater (L should be ~10× workspace radius)
+updater = StarWorldUpdater(L=10.0)
 
-# --- call this at every simulator timestep ---
+# Create obstacles with safety margin
 obstacles = [
-    Ellipse(center=obs_pos, a=radius + safety_margin, b=radius + safety_margin)
-    for obs_pos in current_obstacle_positions
+    Ellipse(center=[x, y], a=radius + 0.05, b=radius + 0.05)
+    for x, y, radius in obstacle_data
 ]
 
+# Reshape obstacles into star-world proxies
 result = updater.update(
-    obstacles = obstacles,
-    robot_pos = robot_workspace_pos,   # shape (2,) for 2D, (3,) for 3D
-    goal_pos  = goal_workspace_pos,
+    obstacles=obstacles,
+    robot_pos=start_pos[:2],  # 2D position [x, y]
+    goal_pos=goal_pos[:2]
 )
 
-# result.proxies[i].center_point  → x_{c,i} for the motion planner
-# result.proxies[i].pieces        → list of convex polygon vertex arrays
-# result.is_disjoint              → True if convergence is guaranteed
+# Plan path using RRT with proxy obstacles
+planner = RRTPlanner(
+    workspace_bounds=[[0.2, -0.6], [0.8, 0.6]],
+    step_size=0.03,
+    goal_bias=0.2,
+    max_iterations=10000
+)
+
+path_2d = planner.plan(
+    start=start_pos[:2],
+    goal=goal_pos[:2],
+    proxy_obstacles=result.proxies
+)
+
+# Lift to 3D and execute (PyBullet IK + joint control)
+# See examples/franka_pybullet_demo.py for full implementation
 ```
+
+**Key points:**
+- `result.proxies` contains the disjoint star-shaped obstacles for collision checking
+- `result.is_disjoint` indicates whether convergence is guaranteed
+- The 2D planner uses `_point_in_polygon_2d()` to check collisions against proxy polygons
+- Scenarios are defined in [examples/obstacle_scenarios.py](examples/obstacle_scenarios.py) for easy configuration
 
 Non-convex obstacles can be modelled as a **union of convex pieces** (e.g. an L-shaped wall as two `ConvexPolygon2D`). Non-convex `Polygon2D` objects are internally decomposed via triangle fan.
 

@@ -3,3 +3,5 @@ scipy>=1.10
 shapely>=2.0
 matplotlib>=3.7
 pytest>=7.0
+pybullet>=3.2.5
+pybullet-data>=3.2.5
