@@ -8,6 +8,7 @@ Star Worlds — implementation of:
 from .obstacles import Ellipse, ConvexPolygon2D, Polygon2D, Ellipsoid
 from .star_world import create_star_world, create_star_world_3d, StarWorldResult, ObstacleProxy
 from .integration import StarWorldUpdater
+from .reactive_controller import ReactiveController
 
 __all__ = [
     "Ellipse",
@@ -19,4 +20,5 @@ __all__ = [
     "StarWorldResult",
     "ObstacleProxy",
     "StarWorldUpdater",
+    "ReactiveController",
 ]

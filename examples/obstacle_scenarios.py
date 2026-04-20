@@ -14,22 +14,47 @@ import numpy as np
 def get_scenario(name='simple'):
     """
     Get obstacle scenario by name.
-    
+
     Available scenarios:
-    - 'simple': 3 obstacles, easy
+    - 'test'    : 1 static obstacle, short path — minimal sanity check
+    - 'simple'  : 3 obstacles, easy
     - 'moderate': 6 obstacles, medium difficulty
     - 'corridor': narrow passage between walls
     """
     scenarios = {
-        'simple': simple_scenario,
+        'test':     test_scenario,
+        'simple':   simple_scenario,
         'moderate': moderate_scenario,
         'corridor': corridor_scenario,
     }
-    
+
     if name not in scenarios:
         raise ValueError(f"Unknown scenario '{name}'. Available: {list(scenarios.keys())}")
-    
+
     return scenarios[name]()
+
+
+def test_scenario():
+    """
+    Minimal sanity-check: 1 static sphere sits exactly on the straight-line
+    path from start to goal.
+
+    Start : [0.38, -0.15, 0.50]
+    Goal  : [0.62,  0.15, 0.50]
+    Obstacle centre: [0.50, 0.0, 0.50], radius 0.10
+
+    Both start/goal are well within the Franka's comfortable reach envelope
+    (~0.5 m from base), so _move_to_start completes quickly.
+    The reactive controller must deflect left or right to pass the sphere.
+    """
+    return [
+        {
+            'radius': 0.10,
+            'color': [1, 0.4, 0, 0.8],   # orange
+            'position': [0.50, 0.0, 0.50],
+            'trajectory': lambda t: np.array([0.50, 0.0, 0.50])  # static
+        },
+    ]
 
 
 def simple_scenario():
@@ -148,18 +173,28 @@ def corridor_scenario():
     return obstacles
 
 
-# Predefined start/goal positions for each scenario
+# Predefined start/goal positions for each scenario.
+#
+# All positions are chosen so that ||pos|| < 0.82 m from the robot base,
+# which keeps them comfortably inside the Franka Panda's reachable workspace
+# (~0.855 m max reach).  Positions that were previously outside this range
+# caused the IK to stall at the arm's extension limit, producing the "trailing
+# off near the end" symptom.
 SCENARIO_WAYPOINTS = {
+    'test': {
+        'start': [0.38, -0.15, 0.50],   # |base| ≈ 0.57 m
+        'goal':  [0.62,  0.15, 0.50],   # |base| ≈ 0.67 m
+    },
     'simple': {
-        'start': [0.25, -0.50, 0.4],  # Bottom-left, clear of obstacles
-        'goal': [0.72, 0.48, 0.4]     # Top-right, clear of obstacles
+        'start': [0.28, -0.40, 0.40],   # |base| ≈ 0.60 m — clear of all obstacles
+        'goal':  [0.60,  0.38, 0.40],   # |base| ≈ 0.77 m — clear of all obstacles
     },
     'moderate': {
-        'start': [0.22, -0.48, 0.4],  # Bottom-left, clear of obstacles
-        'goal': [0.75, 0.48, 0.4]     # Top-right, clear of obstacles (not too far)
+        'start': [0.25, -0.40, 0.40],   # |base| ≈ 0.58 m
+        'goal':  [0.60,  0.44, 0.40],   # |base| ≈ 0.81 m — clear of all proxies
     },
     'corridor': {
-        'start': [0.45, -0.65, 0.4],  # Outside corridor, clear of walls
-        'goal': [0.45, 0.65, 0.4]     # Outside corridor exit, clear of walls
+        'start': [0.45, -0.55, 0.40],   # |base| ≈ 0.78 m — outside corridor
+        'goal':  [0.45,  0.55, 0.40],   # |base| ≈ 0.78 m — outside corridor exit
     },
 }
