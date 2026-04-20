@@ -385,11 +385,15 @@ class FrankaStarWorldsDemo:
             print(f"✗ No path found!")
 
         print("\nDemo complete!")
-        print("Press Ctrl+C or close window to exit.")
+        print("Press Ctrl+C or close the window to exit.")
 
-        for _ in range(500):
+        # Keep simulation running until user closes the window or presses Ctrl+C
+        while True:
             p.stepSimulation()
-            time.sleep(0.01)
+            time.sleep(1.0 / 240.0)
+            # Exit cleanly if the GUI window has been closed
+            if not p.isConnected():
+                break
     
     def cleanup(self):
         """Clean up PyBullet connection."""
