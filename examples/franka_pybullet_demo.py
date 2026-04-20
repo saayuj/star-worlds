@@ -23,7 +23,7 @@ import time
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from starworlds import StarWorldUpdater, Ellipse
+from starworlds import StarWorldUpdater, Ellipsoid
 from starworlds.rrt_planner import RRTPlanner
 from examples.obstacle_scenarios import get_scenario, SCENARIO_WAYPOINTS
 
@@ -52,23 +52,22 @@ class FrankaStarWorldsDemo:
         self.obstacles = self._create_obstacles_from_scenario(scenario)
         print(f"Created {len(self.obstacles)} obstacles")
         
-        # Star-worlds updater (L ~ 10× workspace size)
-        self.star_updater = StarWorldUpdater(L=10.0)
-        
-        # RRT planner configuration
-        # Workspace bounds: approximate Franka reachable space (2D X-Y plane)
-        workspace_lower = np.array([0.2, -0.6])  # x, y
-        workspace_upper = np.array([0.8, 0.6])
-        
+        # Star-worlds updater — n_approx_3d controls sphere surface resolution
+        self.star_updater = StarWorldUpdater(n_approx_3d=64)
+
+        # RRT planner — 3-D EE workspace bounds for the Franka arm
+        workspace_lower_3d = np.array([0.15, -0.70, 0.15])
+        workspace_upper_3d = np.array([0.90,  0.70, 0.85])
+
         self.rrt = RRTPlanner(
-            step_size=0.03,           # Smaller step for finer resolution
-            goal_bias=0.2,            # Higher bias toward goal
-            max_iterations=10000,     # More iterations
+            step_size=0.04,
+            goal_bias=0.20,
+            max_iterations=15000,
             goal_tolerance=0.05,
-            bounds=(workspace_lower, workspace_upper)
+            bounds=(workspace_lower_3d, workspace_upper_3d),
         )
-        
-        # Default Z height for path execution
+
+        # Default Z for waypoints specified in obstacle_scenarios
         self.default_z = 0.4
         
         # Visualization
@@ -137,10 +136,6 @@ class FrankaStarWorldsDemo:
         ee_state = p.getLinkState(self.franka_id, self.ee_link_index)
         return np.array(ee_state[0])
     
-    def get_ee_position_2d(self):
-        """Get current end-effector position projected to 2D (X-Y plane)."""
-        pos_3d = self.get_ee_position()
-        return pos_3d[:2]  # Return only X, Y
     
     def update_obstacle_positions(self, t):
         """Update dynamic obstacle positions based on time."""
@@ -152,238 +147,188 @@ class FrankaStarWorldsDemo:
                 [0, 0, 0, 1]
             )
     
-    def get_starworld_obstacles(self):
-        """Extract obstacles for star-world processing (2D projection to X-Y plane)."""
-        starworld_obstacles = []
-        
+    def get_starworld_obstacles_3d(self):
+        """
+        Read obstacle positions from PyBullet and return 3-D Ellipsoid objects.
+        Each sphere (radius r) is modelled as Ellipsoid(center_3d, Q=r^2*I3).
+        A 5 cm safety margin inflates each sphere.
+        """
+        ellipsoids = []
         for obs in self.obstacles:
             pos, _ = p.getBasePositionAndOrientation(obs['id'])
-            
-            # Add safety margin (5cm)
-            safety_margin = 0.05
-            radius = obs['radius'] + safety_margin
-            
-            # Project to 2D (X-Y plane) - star-worlds works in 2D
-            center_2d = np.array([pos[0], pos[1]])
-            
-            # Create 2D ellipse obstacle
-            starworld_obstacles.append(
-                Ellipse(center=center_2d, a=radius, b=radius)
-            )
-            
-        return starworld_obstacles
+            r = obs['radius'] + 0.05      # 5 cm safety margin
+            Q = (r ** 2) * np.eye(3)
+            ellipsoids.append(Ellipsoid(center=np.array(pos), Q=Q))
+        return ellipsoids
     
     def plan_path(self, start_3d, goal_3d):
         """
-        Plan collision-free path using star-worlds + RRT.
-        
-        Parameters
-        ----------
-        start_3d : np.ndarray
-            Start position in task space (3,)
-        goal_3d : np.ndarray
-            Goal position in task space (3,)
-            
-        Returns
-        -------
-        path : np.ndarray or None
-            Planned path as (N, 3) array, or None if planning fails
+        Plan a 3-D collision-free path using star-worlds (3-D) + RRT.
+        No 2-D projection — star-world and RRT both operate in (x,y,z) EE space.
+        Returns a (N, 3) waypoint array or None.
         """
-        # Project to 2D for star-worlds (X-Y plane)
-        start_2d = start_3d[:2]
-        goal_2d = goal_3d[:2]
-        
-        print(f"  Start (2D): {start_2d}")
-        print(f"  Goal (2D): {goal_2d}")
-        
-        # Get current obstacles (already in 2D)
-        obstacles = self.get_starworld_obstacles()
-        print(f"  Obstacles: {len(obstacles)}")
-        for i, obs in enumerate(obstacles):
-            print(f"    Obs {i}: center={obs.center}, radius={obs.a:.3f}")
-        
-        # Reshape obstacles into disjoint star-shaped proxies
+        start = np.asarray(start_3d, dtype=float)
+        goal  = np.asarray(goal_3d,  dtype=float)
+
+        print(f"  Start: {np.round(start, 3)}")
+        print(f"  Goal:  {np.round(goal, 3)}")
+
+        obstacles_3d = self.get_starworld_obstacles_3d()
+        print(f"  Obstacles: {len(obstacles_3d)}")
+        for i, obs in enumerate(obstacles_3d):
+            r = float(np.sqrt(obs.Q[0, 0]))
+            print(f"    Obs {i}: center={np.round(obs.center, 3)}, r={r:.3f}")
+
+        # Star-world update (Ellipsoid.dim==3 -> dispatched to 3-D algorithm)
         result = self.star_updater.update(
-            obstacles=obstacles,
-            robot_pos=start_2d,
-            goal_pos=goal_2d
+            obstacles=obstacles_3d,
+            robot_pos=start,
+            goal_pos=goal,
         )
-        
-        print(f"  Star-world result: {len(result.proxies)} proxies, disjoint={result.is_disjoint}")
-        obs_centers_2d = [obs.center for obs in obstacles]
+
+        print(f"  Star-world: {len(result.proxies)} proxies, "
+              f"disjoint={result.is_disjoint}")
+        obs_centers = [obs.center for obs in obstacles_3d]
         for i, proxy in enumerate(result.proxies):
             xc = proxy.center_point
-            # Find the closest original obstacle centre (diagnostic)
-            if obs_centers_2d:
-                dists = [np.linalg.norm(xc - oc) for oc in obs_centers_2d]
-                min_d = min(dists)
-                closest = obs_centers_2d[dists.index(min_d)]
-                status = "OK" if min_d < 0.5 else "FAR FROM OBSTACLES - may be a bug"
-                print(f"    Proxy {i}: center={xc}  (dist {min_d:.3f} from obs @ {closest}) [{status}]")
-            else:
-                print(f"    Proxy {i}: center={xc}")
+            dists = [np.linalg.norm(xc - oc) for oc in obs_centers]
+            md = min(dists)
+            tag = "OK" if md < 0.5 else "FAR - possible bug"
+            print(f"    Proxy {i}: center={np.round(xc, 3)}  "
+                  f"(dist {md:.3f} to nearest obs) [{tag}]")
 
-        # Visualize proxy obstacles
-        self._visualize_proxies(result.proxies, z_height=self.default_z)
+        self._visualize_proxies_3d(result.proxies)
 
-        # Plan with RRT in 2D
-        print(f"  Running RRT planner...")
-        path_2d = self.rrt.plan(
-            start=start_2d,
-            goal=goal_2d,
-            obstacle_proxies=result.proxies
+        print(f"  Running 3-D RRT...")
+        path = self.rrt.plan(
+            start=start,
+            goal=goal,
+            obstacle_proxies=result.proxies,
         )
 
-        if path_2d is None:
-            print(f"  RRT failed to find path — check proxy coverage and start/goal positions")
+        if path is None:
+            print(f"  RRT failed to find a path")
             return None
 
-        print(f"  Path found: {len(path_2d)} waypoints, "
-              f"length={sum(np.linalg.norm(path_2d[k+1]-path_2d[k]) for k in range(len(path_2d)-1)):.3f} m")
-        
-        # Convert 2D path back to 3D by interpolating Z between start and goal
-        path_3d = self._lift_path_to_3d(path_2d, start_3d[2], goal_3d[2])
-        
-        return path_3d
-    
-    def _lift_path_to_3d(self, path_2d, start_z, goal_z):
-        """Convert 2D path to 3D by linearly interpolating Z coordinate."""
-        n_points = len(path_2d)
-        z_values = np.linspace(start_z, goal_z, n_points)
-        path_3d = np.column_stack([path_2d, z_values])
-        return path_3d
-    
-    def _move_ee_to_position(self, target_pos, duration=2.0):
-        """Move end-effector to target position using IK."""
-        num_steps = int(240 * duration)  # 240 Hz
-        
-        for _ in range(num_steps):
-            # IK to get joint positions
+        length = sum(
+            np.linalg.norm(path[k + 1] - path[k]) for k in range(len(path) - 1)
+        )
+        print(f"  Path: {len(path)} waypoints, length={length:.3f} m")
+        return path
+
+    def _move_ee_to_position(
+        self,
+        target_pos: np.ndarray,
+        max_steps: int = 1200,
+        tolerance: float = 0.03,
+    ):
+        """
+        Move the EE to target_pos using IK, waiting until arrival or timeout.
+        Replaces the old fixed-duration loop with an arrival-verified loop.
+        """
+        target = np.asarray(target_pos, dtype=float)
+        num_joints = p.getNumJoints(self.franka_id)
+        for step in range(max_steps):
             joint_poses = p.calculateInverseKinematics(
                 self.franka_id,
                 self.ee_link_index,
-                target_pos.tolist()
+                target.tolist(),
             )
-            
-            # Set joint positions
-            num_joints = p.getNumJoints(self.franka_id)
-            for joint_idx in range(min(len(joint_poses), num_joints)):
+            for ji in range(min(7, num_joints)):
                 p.setJointMotorControl2(
-                    self.franka_id,
-                    joint_idx,
+                    self.franka_id, ji,
                     p.POSITION_CONTROL,
-                    joint_poses[joint_idx]
+                    targetPosition=joint_poses[ji],
+                    force=500,
                 )
-            
             p.stepSimulation()
             time.sleep(1.0 / 240.0)
-    
-    def _visualize_proxies(self, proxies, z_height=0.4):
-        """Visualize star-shaped proxy obstacles (2D proxies shown at fixed Z height)."""
-        # Remove old visualizations
+            if step % 12 == 0:
+                ee_pos = np.array(
+                    p.getLinkState(self.franka_id, self.ee_link_index)[0]
+                )
+                if np.linalg.norm(ee_pos - target) < tolerance:
+                    return
+
+    def _visualize_proxies_3d(self, proxies):
+        """Show each proxy centre (green sphere) and bounding sphere (transparent)."""
         for vid in self.proxy_visual_ids:
             p.removeBody(vid)
         self.proxy_visual_ids.clear()
-        
-        # Draw new proxies
         for proxy in proxies:
-            # Convert 2D center to 3D
-            center_3d = [proxy.center_point[0], proxy.center_point[1], z_height]
-            
-            # Draw center point
-            center_visual = p.createVisualShape(
-                p.GEOM_SPHERE,
-                radius=0.02,
-                rgbaColor=[0, 1, 0, 1]
+            xc = proxy.center_point.tolist()
+            cvis = p.createVisualShape(p.GEOM_SPHERE, radius=0.02,
+                                       rgbaColor=[0, 1, 0, 1])
+            self.proxy_visual_ids.append(
+                p.createMultiBody(baseMass=0,
+                                  baseVisualShapeIndex=cvis,
+                                  basePosition=xc)
             )
-            center_body = p.createMultiBody(
-                baseMass=0,
-                baseVisualShapeIndex=center_visual,
-                basePosition=center_3d
-            )
-            self.proxy_visual_ids.append(center_body)
-            
-            # Draw bounding sphere (approximate visualization)
-            if hasattr(proxy, 'pieces') and len(proxy.pieces) > 0:
-                # Compute approximate radius from pieces
-                max_dist = 0
-                for piece in proxy.pieces:
-                    if len(piece) > 0:
-                        dists = np.linalg.norm(piece - proxy.center_point, axis=1)
-                        max_dist = max(max_dist, np.max(dists))
-                
-                if max_dist > 0:
-                    boundary_visual = p.createVisualShape(
-                        p.GEOM_SPHERE,
-                        radius=max_dist,
-                        rgbaColor=[0, 1, 0, 0.2]
+            if proxy.pieces:
+                all_pts = np.vstack(proxy.pieces)
+                max_r = float(np.max(
+                    np.linalg.norm(all_pts - proxy.center_point, axis=1)
+                ))
+                if max_r > 0.01:
+                    svis = p.createVisualShape(p.GEOM_SPHERE, radius=max_r,
+                                               rgbaColor=[0, 1, 0, 0.15])
+                    self.proxy_visual_ids.append(
+                        p.createMultiBody(baseMass=0,
+                                          baseVisualShapeIndex=svis,
+                                          basePosition=xc)
                     )
-                    boundary_body = p.createMultiBody(
-                        baseMass=0,
-                        baseVisualShapeIndex=boundary_visual,
-                        basePosition=center_3d
-                    )
-                    self.proxy_visual_ids.append(boundary_body)
-    
+
     def visualize_path(self, path):
-        """Draw path in PyBullet."""
-        # Remove old path lines
+        """Draw the planned path as yellow line segments in PyBullet."""
         for line_id in self.path_line_ids:
             p.removeUserDebugItem(line_id)
         self.path_line_ids.clear()
-        
         if path is None or len(path) < 2:
             return
-            
-        # Draw line segments
         for i in range(len(path) - 1):
-            line_id = p.addUserDebugLine(
+            lid = p.addUserDebugLine(
                 path[i].tolist(),
                 path[i + 1].tolist(),
                 lineColorRGB=[1, 1, 0],
-                lineWidth=3
+                lineWidth=3,
             )
-            self.path_line_ids.append(line_id)
-    
-    def execute_path(self, path, duration=5.0):
+            self.path_line_ids.append(lid)
+
+    def execute_path(self, path, waypoint_tolerance: float = 0.04):
         """
-        Execute path using simple end-effector position control.
-        
-        Note: This is a simplified version. For production, use proper
-        inverse kinematics and joint-space trajectory tracking.
+        Execute a 3-D EE path with arrival-verified IK control.
+        For each waypoint the arm drives via IK until within waypoint_tolerance
+        or until a per-waypoint step budget is exhausted.
         """
         if path is None:
             print("No path to execute!")
             return
-            
         print(f"Executing path with {len(path)} waypoints...")
-        
-        num_steps = len(path)
-        time_per_step = duration / num_steps
-        
+        num_joints = p.getNumJoints(self.franka_id)
         for i, waypoint in enumerate(path):
-            # Simple IK: use PyBullet's built-in IK solver
-            joint_poses = p.calculateInverseKinematics(
-                self.franka_id,
-                self.ee_link_index,
-                waypoint.tolist()
-            )
-            
-            # Set joint positions
-            num_joints = p.getNumJoints(self.franka_id)
-            for joint_idx in range(min(len(joint_poses), num_joints)):
-                p.setJointMotorControl2(
+            target = np.asarray(waypoint, dtype=float)
+            for step in range(480):   # up to 2 s per waypoint at 240 Hz
+                joint_poses = p.calculateInverseKinematics(
                     self.franka_id,
-                    joint_idx,
-                    p.POSITION_CONTROL,
-                    joint_poses[joint_idx]
+                    self.ee_link_index,
+                    target.tolist(),
                 )
-            
-            # Step simulation
-            for _ in range(int(240 * time_per_step)):  # 240 Hz
+                for ji in range(min(7, num_joints)):
+                    p.setJointMotorControl2(
+                        self.franka_id, ji,
+                        p.POSITION_CONTROL,
+                        targetPosition=joint_poses[ji],
+                        force=500,
+                    )
                 p.stepSimulation()
                 time.sleep(1.0 / 240.0)
-    
+                if step % 12 == 0:
+                    ee_pos = np.array(
+                        p.getLinkState(self.franka_id, self.ee_link_index)[0]
+                    )
+                    if np.linalg.norm(ee_pos - target) < waypoint_tolerance:
+                        break
+
     def run_demo(self):
         """Run the complete demo."""
         print("="*60)
@@ -413,30 +358,35 @@ class FrankaStarWorldsDemo:
         
         # Plan and execute path
         t = 0
-        current_pos = self.get_ee_position()
         
-        print(f"\nPlanning path from {start[:2]} to {goal[:2]}...")
-        
-        # Update obstacles
+        # Update obstacle positions at t=0
         self.update_obstacle_positions(t)
-        
+
+        # Use actual EE position as planning start
+        current_pos = self.get_ee_position()
+        print(f"\nPlanning 3-D path from {np.round(current_pos, 3)} to {np.round(goal, 3)}...")
+
         current_path = self.plan_path(current_pos, goal)
-        
+
         if current_path is not None:
-            print(f"✓ Path found with {len(current_path)} waypoints")
+            print(f"✓ Path found: {len(current_path)} waypoints")
             self.visualize_path(current_path)
-            
-            # Execute path
             print(f"Executing path...")
-            self.execute_path(current_path, duration=3.0)
-            print(f"✓ Path execution complete!")
+            self.execute_path(current_path)
+
+            final_pos = self.get_ee_position()
+            dist_to_goal = float(np.linalg.norm(final_pos - goal))
+            if dist_to_goal < 0.08:
+                print(f"✓ Goal reached! (dist={dist_to_goal:.3f} m)")
+            else:
+                print(f"⚠ Arm stopped {dist_to_goal:.3f} m from goal "
+                      f"(EE @ {np.round(final_pos, 3)})")
         else:
             print(f"✗ No path found!")
-        
+
         print("\nDemo complete!")
         print("Press Ctrl+C or close window to exit.")
-        
-        # Keep window open for a bit longer
+
         for _ in range(500):
             p.stepSimulation()
             time.sleep(0.01)

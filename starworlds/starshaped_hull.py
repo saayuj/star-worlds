@@ -37,6 +37,11 @@ from .geometry import (
     polygon_contains_point,
     polygons_intersect,
 )
+from .geometry_3d import (
+    convex_hull_3d,
+    polygon_centroid_3d,
+    polygons_intersect_3d,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +176,67 @@ def proxy_pieces_intersect(
 
 
 # ---------------------------------------------------------------------------
-# Center point extraction for the motion planner
+# 3-D starshaped hull  (Eq. 11 lifted to R³)
+# ---------------------------------------------------------------------------
+
+def sh_kernel_obstacle_3d(
+    obstacle,
+    K: np.ndarray,
+    n_approx: int = 128,
+) -> Optional[np.ndarray]:
+    """
+    3-D analogue of Eq. (11):  SH_kerK(A) = CH(A ∪ K).
+
+    For a convex obstacle the starshaped hull is the convex hull of the
+    obstacle surface samples together with the kernel points K.
+
+    Returns a (m, 3) array of hull vertices, or None.
+    """
+    K = np.asarray(K, dtype=float).reshape(-1, 3)
+    obs_pts = obstacle.polygon_approximation(n=n_approx)   # (n, 3)
+    all_pts = np.vstack([obs_pts, K])
+    return convex_hull_3d(all_pts)
+
+
+def sh_kernel_cluster_3d(
+    obstacles: list,
+    K: np.ndarray,
+    n_approx: int = 128,
+) -> List[Optional[np.ndarray]]:
+    """
+    3-D Property 4d:  SH_kerK(∪_i A_i) = ∪_i SH_kerK(A_i).
+
+    Returns one (m_i, 3) hull-vertex array per obstacle.
+    """
+    return [sh_kernel_obstacle_3d(obs, K, n_approx) for obs in obstacles]
+
+
+def proxy_pieces_intersect_3d(
+    pieces_a: List[np.ndarray],
+    pieces_b: List[np.ndarray],
+) -> bool:
+    """Check whether two 3-D proxy unions overlap (re-clustering step)."""
+    for pa in pieces_a:
+        for pb in pieces_b:
+            if pa is None or pb is None:
+                continue
+            if polygons_intersect_3d(pa, pb):
+                return True
+    return False
+
+
+def center_point_from_kernel_3d(K: np.ndarray) -> np.ndarray:
+    """
+    Centroid of the 3-D kernel tetrahedron K (shape (4, 3)).
+
+    The centroid lies in the interior of CH(K) and serves as the reference
+    point x_{c,i} for the motion planner.
+    """
+    return np.mean(np.asarray(K, dtype=float), axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Center point extraction for the motion planner (2-D)
 # ---------------------------------------------------------------------------
 
 def center_point_from_kernel(

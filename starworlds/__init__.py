@@ -6,7 +6,7 @@ Star Worlds — implementation of:
 """
 
 from .obstacles import Ellipse, ConvexPolygon2D, Polygon2D, Ellipsoid
-from .star_world import create_star_world, StarWorldResult, ObstacleProxy
+from .star_world import create_star_world, create_star_world_3d, StarWorldResult, ObstacleProxy
 from .integration import StarWorldUpdater
 
 __all__ = [
@@ -15,6 +15,7 @@ __all__ = [
     "Polygon2D",
     "Ellipsoid",
     "create_star_world",
+    "create_star_world_3d",
     "StarWorldResult",
     "ObstacleProxy",
     "StarWorldUpdater",

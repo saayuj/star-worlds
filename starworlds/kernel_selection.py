@@ -33,6 +33,7 @@ from .geometry import (
     half_plane_polygon_2d,
     sutherland_hodgman,
 )
+from .geometry_3d import polygon_centroid_3d, regular_tetrahedron_3d
 
 
 def select_kernel_2d(
@@ -99,7 +100,54 @@ def select_kernel_2d(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# 3-D kernel selection
+# ---------------------------------------------------------------------------
+
+def select_kernel_3d(
+    cluster_hull_pts: np.ndarray,
+    eps_frac: float = 0.10,
+    eps_min: float = 1e-4,
+    k_prev_centroid: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Select a regular tetrahedron K (4 × 3) as the 3-D kernel for a cluster.
+
+    The centroid of the tetrahedron is placed at the cluster-hull centroid.
+    Temporal coherence: if *k_prev_centroid* is close to the cluster, reuse it.
+
+    Parameters
+    ----------
+    cluster_hull_pts : (n, 3) vertices of the cluster's 3-D convex hull.
+    eps_frac         : tetrahedron circumradius = eps_frac × mean hull radius.
+    eps_min          : absolute minimum circumradius.
+    k_prev_centroid  : centroid from the previous timestep.
+
+    Returns
+    -------
+    K   : (4, 3) tetrahedron vertices, or None.
+    k_c : (3,) centroid, or None.
+    """
+    if cluster_hull_pts is None or len(cluster_hull_pts) < 4:
+        return None, None
+
+    pts = np.asarray(cluster_hull_pts, dtype=float)
+    centroid = polygon_centroid_3d(pts)
+
+    # Temporal coherence: reuse previous centroid if it's close enough
+    if k_prev_centroid is not None:
+        k_prev = np.asarray(k_prev_centroid, dtype=float)
+        mean_r = float(np.mean(np.linalg.norm(pts - centroid, axis=1)))
+        if np.linalg.norm(k_prev - centroid) < 0.8 * mean_r:
+            centroid = k_prev
+
+    mean_r = float(np.mean(np.linalg.norm(pts - centroid, axis=1)))
+    eps = max(eps_frac * mean_r, eps_min)
+    K = regular_tetrahedron_3d(centroid, eps)
+    return K, centroid
+
+
+# ---------------------------------------------------------------------------
+# 2-D internal helpers
 # ---------------------------------------------------------------------------
 
 def _choose_centroid(

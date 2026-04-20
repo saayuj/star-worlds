@@ -6,7 +6,8 @@ star-shaped obstacle proxies.
 """
 
 import numpy as np
-from typing import List, Optional, Tuple
+from scipy.spatial import ConvexHull
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -77,18 +78,28 @@ class RRTPlanner:
             Returns None if no path found within max_iterations.
         """
         start = np.asarray(start, dtype=float)
-        goal = np.asarray(goal, dtype=float)
-        
+        goal  = np.asarray(goal,  dtype=float)
+
         if obstacle_proxies is None:
             obstacle_proxies = []
-            
+
+        # Pre-compute hull equations for 3-D proxies (O(n_faces) containment)
+        self._proxy_equations: Dict[int, List] = {}
+        for pid, proxy in enumerate(obstacle_proxies):
+            self._proxy_equations[pid] = self._precompute_proxy_equations(proxy)
+
         # Initialize tree with start node
         tree = [RRTNode(position=start.copy())]
-        
-        # Debug: Check if start or goal is in collision
-        start_collision = any(self._point_in_proxy(start, proxy) for proxy in obstacle_proxies)
-        goal_collision = any(self._point_in_proxy(goal, proxy) for proxy in obstacle_proxies)
-        
+
+        # Collision check for start / goal
+        start_collision = any(
+            self._point_in_proxy(start, proxy, pid)
+            for pid, proxy in enumerate(obstacle_proxies)
+        )
+        goal_collision = any(
+            self._point_in_proxy(goal, proxy, pid)
+            for pid, proxy in enumerate(obstacle_proxies)
+        )
         if start_collision:
             print(f"    WARNING: Start position is in collision!")
         if goal_collision:
@@ -173,61 +184,66 @@ class RRTPlanner:
         
         for alpha in alphas:
             point = from_pos + alpha * (to_pos - from_pos)
-            
-            # Check collision with each obstacle proxy
-            for proxy in obstacle_proxies:
-                if self._point_in_proxy(point, proxy):
+            for pid, proxy in enumerate(obstacle_proxies):
+                if self._point_in_proxy(point, proxy, pid):
                     return False
-                    
         return True
-    
-    def _point_in_proxy(self, point: np.ndarray, proxy) -> bool:
+
+    # ---------------------------------------------------------------------- #
+    # Proxy containment helpers                                                #
+    # ---------------------------------------------------------------------- #
+
+    def _precompute_proxy_equations(self, proxy) -> List:
         """
-        Check if point is inside any piece of the obstacle proxy.
-        
-        For 2D: uses ray-casting algorithm for point-in-polygon test.
-        For 3D: simplified bounding sphere check.
+        Pre-compute scipy ConvexHull.equations for each 3-D piece so that
+        containment tests inside the RRT loop are O(n_faces).
+        Returns a list with one entry per piece: equations array or None.
+        2-D pieces (shape (n, 2)) get None — they use the ray-cast test.
+        """
+        eqs = []
+        if not hasattr(proxy, 'pieces'):
+            return eqs
+        for piece in proxy.pieces:
+            piece = np.asarray(piece, dtype=float)
+            if piece.ndim == 2 and piece.shape[1] == 3 and len(piece) >= 4:
+                try:
+                    hull = ConvexHull(piece)
+                    eqs.append(hull.equations)
+                except Exception:
+                    eqs.append(None)
+            else:
+                eqs.append(None)
+        return eqs
+
+    def _point_in_proxy(self, point: np.ndarray, proxy, proxy_id: int = -1) -> bool:
+        """
+        Check if *point* is inside any convex piece of the obstacle proxy.
+
+        2-D pieces (n, 2) — ray-casting algorithm.
+        3-D pieces (n, 3) — pre-computed half-space equations (exact test).
         """
         if not hasattr(proxy, 'pieces'):
-            # Fallback: use simple distance check with center
-            if hasattr(proxy, 'center_point'):
-                # Approximate with radius (conservative estimate)
-                radius = getattr(proxy, 'a', 0.1)  # default if not available
-                return np.linalg.norm(point[:len(proxy.center_point)] - proxy.center_point) < radius
             return False
-            
-        # Check each convex piece
-        for piece_vertices in proxy.pieces:
-            if len(point) == 2:
-                if self._point_in_polygon_2d(point, piece_vertices):
+
+        eqs_list = self._proxy_equations.get(proxy_id, [None] * len(proxy.pieces))
+
+        for piece, eq in zip(proxy.pieces, eqs_list):
+            piece = np.asarray(piece, dtype=float)
+            if piece.ndim != 2:
+                continue
+            if piece.shape[1] == 2:
+                if self._point_in_polygon_2d(point[:2], piece):
                     return True
-            else:
-                # 3D: simplified check - project to 2D or use bounding box
-                if self._point_in_convex_hull_3d(point, piece_vertices):
+            elif piece.shape[1] == 3:
+                if self._point_in_convex_hull_3d(point, piece, eq):
                     return True
-                    
         return False
-    
+
     def _point_in_polygon_2d(self, point: np.ndarray, vertices: np.ndarray) -> bool:
-        """
-        Ray-casting algorithm for point-in-polygon test (2D).
-        
-        Parameters
-        ----------
-        point : np.ndarray
-            Test point, shape (2,)
-        vertices : np.ndarray
-            Polygon vertices, shape (N, 2)
-            
-        Returns
-        -------
-        inside : bool
-            True if point is inside polygon
-        """
+        """Ray-casting point-in-polygon test (2-D)."""
         x, y = point
         n = len(vertices)
         inside = False
-        
         p1x, p1y = vertices[0]
         for i in range(1, n + 1):
             p2x, p2y = vertices[i % n]
@@ -239,21 +255,32 @@ class RRTPlanner:
                         if p1x == p2x or x <= xinters:
                             inside = not inside
             p1x, p1y = p2x, p2y
-            
         return inside
-    
-    def _point_in_convex_hull_3d(self, point: np.ndarray, vertices: np.ndarray) -> bool:
+
+    def _point_in_convex_hull_3d(
+        self,
+        point: np.ndarray,
+        vertices: np.ndarray,
+        equations: Optional[np.ndarray] = None,
+        tol: float = 1e-9,
+    ) -> bool:
         """
-        Simplified 3D collision check using bounding sphere.
-        
-        For production use, consider using shapely/trimesh for proper 3D checks.
+        Exact 3-D point-in-convex-hull test via half-space representation.
+
+        Uses pre-computed *equations* when available (O(n_faces)).
+        Falls back to recomputing the hull from *vertices* otherwise.
         """
-        # Compute centroid and max radius
-        centroid = np.mean(vertices, axis=0)
-        radius = np.max(np.linalg.norm(vertices - centroid, axis=1))
-        
-        # Conservative check: point within bounding sphere
-        return np.linalg.norm(point - centroid) < radius
+        p = np.asarray(point, dtype=float)
+        if equations is not None:
+            return bool(np.all(equations[:, :3] @ p + equations[:, 3] <= tol))
+        pts = np.asarray(vertices, dtype=float)
+        if len(pts) < 4:
+            return False
+        try:
+            hull = ConvexHull(pts)
+            return bool(np.all(hull.equations[:, :3] @ p + hull.equations[:, 3] <= tol))
+        except Exception:
+            return False
     
     def _extract_path(self, goal_node: RRTNode) -> np.ndarray:
         """
@@ -310,11 +337,16 @@ class RRTStarPlanner(RRTPlanner):
         See RRTPlanner.plan() for parameter documentation.
         """
         start = np.asarray(start, dtype=float)
-        goal = np.asarray(goal, dtype=float)
-        
+        goal  = np.asarray(goal,  dtype=float)
+
         if obstacle_proxies is None:
             obstacle_proxies = []
-            
+
+        # Pre-compute hull equations for 3-D proxies
+        self._proxy_equations = {}
+        for pid, proxy in enumerate(obstacle_proxies):
+            self._proxy_equations[pid] = self._precompute_proxy_equations(proxy)
+
         tree = [RRTNode(position=start.copy())]
         best_goal_node = None
         

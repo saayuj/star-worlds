@@ -355,6 +355,185 @@ def _flatten_obstacles(
     return flat_obstacles, flat_origins
 
 
+# ===========================================================================
+# 3-D Algorithm 2
+# ===========================================================================
+
+def create_star_world_3d(
+    obstacles: list,
+    x: np.ndarray,
+    xg: np.ndarray,
+    prev_result: Optional["StarWorldResult"] = None,
+    n_approx: int = 128,
+    max_iter: int = 20,
+) -> "StarWorldResult":
+    """
+    3-D version of Algorithm 2 for Ellipsoid obstacles.
+
+    The admissible kernel region is approximated by the cluster's 3-D convex
+    hull (the same robust fallback that the fixed 2-D implementation uses).
+    The kernel K is a small regular tetrahedron at the cluster centroid.
+
+    Proxy pieces are (m, 3) vertex arrays representing the 3-D starshaped hull
+    of each obstacle cluster.
+
+    Parameters
+    ----------
+    obstacles : list of Ellipsoid objects.
+    x         : robot EE position, shape (3,).
+    xg        : goal EE position,  shape (3,).
+    prev_result : previous StarWorldResult for temporal coherence.
+    n_approx  : surface-point sampling resolution per obstacle.
+    max_iter  : clustering loop safety cap.
+    """
+    from .geometry_3d import convex_hull_3d, polygon_centroid_3d
+    from .starshaped_hull import (
+        sh_kernel_cluster_3d,
+        proxy_pieces_intersect_3d,
+        center_point_from_kernel_3d,
+    )
+    from .kernel_selection import select_kernel_3d
+
+    x  = np.asarray(x,  dtype=float)
+    xg = np.asarray(xg, dtype=float)
+
+    # Previous centroid map for temporal coherence
+    prev_centroids: Dict[FrozenSet[int], np.ndarray] = {}
+    if prev_result is not None:
+        for proxy in prev_result.proxies:
+            key = frozenset(proxy.original_indices)
+            prev_centroids[key] = proxy.center_point
+
+    # Each obstacle starts in its own cluster
+    clusters: List[FrozenSet[int]] = [frozenset([i]) for i in range(len(obstacles))]
+
+    for _ in range(max_iter):
+        proxies_raw: List[Tuple[List[np.ndarray], Optional[np.ndarray], List[int]]] = []
+        early_exit = False
+
+        for cl in clusters:
+            cl_list = sorted(cl)
+            cl_obs = [obstacles[i] for i in cl_list]
+
+            # Feasible kernel region = 3-D convex hull of cluster surface pts
+            all_surf = np.vstack([obs.polygon_approximation(n=n_approx) for obs in cl_obs])
+            cluster_hull = convex_hull_3d(all_surf)
+            if cluster_hull is None:
+                early_exit = True
+                break
+
+            # Kernel: tetrahedron at cluster centroid
+            prev_k = prev_centroids.get(frozenset(cl_list))
+            K, kc = select_kernel_3d(cluster_hull, k_prev_centroid=prev_k)
+            if K is None:
+                early_exit = True
+                break
+
+            pieces = sh_kernel_cluster_3d(cl_obs, K, n_approx=n_approx)
+            proxies_raw.append((pieces, K, cl_list))
+
+        if early_exit:
+            break
+
+        # Re-clustering: merge proxy pairs whose 3-D hulls overlap
+        new_clusters = _recluster_3d(proxies_raw)
+        if len(new_clusters) == len(clusters):
+            break
+        clusters = new_clusters
+
+    if early_exit:
+        return _fallback_result_3d(obstacles, n_approx)
+
+    result_proxies = []
+    for pieces, K, orig_idx in proxies_raw:
+        if not pieces or K is None:
+            continue
+        xc = center_point_from_kernel_3d(K)
+        result_proxies.append(ObstacleProxy(
+            pieces=pieces,
+            kernel_K=K,
+            center_point=xc,
+            original_indices=orig_idx,
+            is_fallback=False,
+        ))
+
+    is_disjoint = _check_disjoint_3d(result_proxies)
+    return StarWorldResult(
+        proxies=result_proxies,
+        is_disjoint=is_disjoint,
+        clusters=[frozenset(p.original_indices) for p in result_proxies],
+    )
+
+
+def _recluster_3d(proxies_raw: list) -> List[FrozenSet[int]]:
+    """Union-find re-clustering for 3-D proxies."""
+    from .starshaped_hull import proxy_pieces_intersect_3d
+
+    n = len(proxies_raw)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        pa, pb = find(a), find(b)
+        if pa != pb:
+            parent[pa] = pb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if proxy_pieces_intersect_3d(proxies_raw[i][0], proxies_raw[j][0]):
+                union(i, j)
+
+    groups: Dict[int, FrozenSet[int]] = {}
+    for i, (_, _, orig_idx) in enumerate(proxies_raw):
+        root = find(i)
+        groups[root] = groups.get(root, frozenset()) | frozenset(orig_idx)
+
+    return list(groups.values())
+
+
+def _fallback_result_3d(obstacles: list, n_approx: int) -> "StarWorldResult":
+    """Convex-hull fallback when 3-D kernel selection fails."""
+    from .geometry_3d import convex_hull_3d, polygon_centroid_3d
+
+    proxies = []
+    for i, obs in enumerate(obstacles):
+        pts = obs.polygon_approximation(n=n_approx)
+        hull = convex_hull_3d(pts)
+        centroid = polygon_centroid_3d(pts)
+        proxies.append(ObstacleProxy(
+            pieces=[hull if hull is not None else pts],
+            kernel_K=None,
+            center_point=centroid,
+            original_indices=[i],
+            is_fallback=True,
+        ))
+    return StarWorldResult(
+        proxies=proxies,
+        is_disjoint=False,
+        clusters=[frozenset(p.original_indices) for p in proxies],
+    )
+
+
+def _check_disjoint_3d(proxies: List[ObstacleProxy]) -> bool:
+    """Disjointness check for 3-D proxies."""
+    from .starshaped_hull import proxy_pieces_intersect_3d
+    n = len(proxies)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if proxy_pieces_intersect_3d(proxies[i].pieces, proxies[j].pieces):
+                return False
+    return True
+
+
+# ===========================================================================
+# 2-D helper (unchanged)
+# ===========================================================================
+
 def _check_disjoint(proxies: List[ObstacleProxy]) -> bool:
     """
     Verify that no two proxy obstacles share interior points.

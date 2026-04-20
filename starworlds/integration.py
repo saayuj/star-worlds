@@ -1,30 +1,17 @@
 """
 Integration interface between the Star Worlds algorithm and your motion planner / simulator.
 
-Usage
------
-    from starworlds import StarWorldUpdater, Ellipse, ConvexPolygon2D
+Usage — 2-D (Ellipse / ConvexPolygon2D obstacles):
+    result = updater.update(obstacles=[obs1, obs2, ...],
+                            robot_pos=np.array([x, y]),
+                            goal_pos=np.array([gx, gy]))
 
-    updater = StarWorldUpdater()
+Usage — 3-D (Ellipsoid obstacles) — auto-detected from obstacle.dim == 3:
+    result = updater.update(obstacles=[ell1, ell2, ...],
+                            robot_pos=np.array([x, y, z]),
+                            goal_pos=np.array([gx, gy, gz]))
 
-    # At each timestep (e.g. from PyBullet / Gazebo callback):
-    result = updater.update(
-        obstacles   = [obs1, obs2, ...],   # current obstacle geometry
-        robot_pos   = np.array([x, y]),    # robot position in workspace
-        goal_pos    = np.array([gx, gy]),  # goal position
-    )
-
-    # Pass to motion planner:
-    for proxy in result.proxies:
-        center = proxy.center_point   # x_{c,i} ∈ ker(O'_i) for harmonic planner
-        pieces = proxy.pieces         # convex polygon list for boundary queries
-
-The updater maintains state across calls for temporal coherence (Algorithm 3):
-  consistent kernel centroid reuse keeps obstacle shapes stable between frames
-  so the motion planner generates smooth trajectories (§V-C).
-
-For the Franka arm (3-D workspace), model each link/object as an Ellipsoid.
-The current implementation handles 2-D obstacles only; 3-D support is in progress.
+The updater maintains temporal coherence across calls (Algorithm 3).
 """
 
 from __future__ import annotations
@@ -32,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 from typing import List, Optional
 
-from .star_world import create_star_world, StarWorldResult
+from .star_world import create_star_world, create_star_world_3d, StarWorldResult
 
 
 class StarWorldUpdater:
@@ -46,9 +33,16 @@ class StarWorldUpdater:
     max_iter  : maximum Algorithm 2 iterations (≤ 5 in all practical cases, §V-D).
     """
 
-    def __init__(self, L: float = 1e4, n_approx: int = 64, max_iter: int = 20):
+    def __init__(
+        self,
+        L: float = 1e4,
+        n_approx: int = 64,
+        n_approx_3d: int = 128,
+        max_iter: int = 20,
+    ):
         self.L = L
         self.n_approx = n_approx
+        self.n_approx_3d = n_approx_3d
         self.max_iter = max_iter
         self._prev_result: Optional[StarWorldResult] = None
 
@@ -88,15 +82,32 @@ class StarWorldUpdater:
         x  = np.asarray(robot_pos, dtype=float)
         xg = np.asarray(goal_pos,  dtype=float)
 
-        result = create_star_world(
-            obstacles   = obstacles,
-            x           = x,
-            xg          = xg,
-            prev_result = self._prev_result,
-            L           = self.L,
-            n_approx    = self.n_approx,
-            max_iter    = self.max_iter,
+        # Auto-detect 3-D from the first obstacle's .dim attribute
+        is_3d = (
+            len(obstacles) > 0
+            and hasattr(obstacles[0], 'dim')
+            and obstacles[0].dim == 3
         )
+
+        if is_3d:
+            result = create_star_world_3d(
+                obstacles   = obstacles,
+                x           = x,
+                xg          = xg,
+                prev_result = self._prev_result,
+                n_approx    = self.n_approx_3d,
+                max_iter    = self.max_iter,
+            )
+        else:
+            result = create_star_world(
+                obstacles   = obstacles,
+                x           = x,
+                xg          = xg,
+                prev_result = self._prev_result,
+                L           = self.L,
+                n_approx    = self.n_approx,
+                max_iter    = self.max_iter,
+            )
 
         self._prev_result = result
         return result
