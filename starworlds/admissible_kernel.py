@@ -220,20 +220,25 @@ def feasible_kernel_region(
     if ch_cluster is None:
         return None
 
-    # Try intersection with cluster union (convex hull approximation)
-    feasible = sutherland_hodgman(convex_hull_2d(ak_polygon), ch_cluster)
+    ak_ch = convex_hull_2d(ak_polygon)
+    if ak_ch is None:
+        return ch_cluster
 
+    # Primary: clip cluster against AK convex hull.
+    # When the AK is large and contains the cluster (the typical case), this
+    # returns the cluster itself since all cluster vertices are inside the AK.
+    feasible = sutherland_hodgman(ch_cluster, ak_ch)
     if feasible is not None and len(feasible) >= 3:
         return feasible
 
-    # Fallback: intersect AK with convex hull of cluster (Property 4c)
-    ak_ch = convex_hull_2d(ak_polygon)
-    if ak_ch is None:
-        return None
+    # Fallback: clip AK convex hull against cluster (intersection).
+    # Handles the case where AK and cluster partially overlap.
     feasible = sutherland_hodgman(ak_ch, ch_cluster)
     if feasible is not None and len(feasible) >= 3:
         return feasible
 
-    # Last resort: just use the AK polygon itself (kernel outside obstacles)
-    ak_ch = convex_hull_2d(ak_polygon)
-    return ak_ch
+    # Last resort: place kernel inside the obstacle cluster.
+    # Returning the raw AK polygon centroid (which can be far from the
+    # obstacles when the cone spans >180°) is incorrect — always anchor
+    # the kernel inside the obstacle cluster instead.
+    return ch_cluster

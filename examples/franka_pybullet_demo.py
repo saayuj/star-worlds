@@ -210,12 +210,22 @@ class FrankaStarWorldsDemo:
         )
         
         print(f"  Star-world result: {len(result.proxies)} proxies, disjoint={result.is_disjoint}")
+        obs_centers_2d = [obs.center for obs in obstacles]
         for i, proxy in enumerate(result.proxies):
-            print(f"    Proxy {i}: center={proxy.center_point}")
-        
+            xc = proxy.center_point
+            # Find the closest original obstacle centre (diagnostic)
+            if obs_centers_2d:
+                dists = [np.linalg.norm(xc - oc) for oc in obs_centers_2d]
+                min_d = min(dists)
+                closest = obs_centers_2d[dists.index(min_d)]
+                status = "OK" if min_d < 0.5 else "FAR FROM OBSTACLES - may be a bug"
+                print(f"    Proxy {i}: center={xc}  (dist {min_d:.3f} from obs @ {closest}) [{status}]")
+            else:
+                print(f"    Proxy {i}: center={xc}")
+
         # Visualize proxy obstacles
         self._visualize_proxies(result.proxies, z_height=self.default_z)
-        
+
         # Plan with RRT in 2D
         print(f"  Running RRT planner...")
         path_2d = self.rrt.plan(
@@ -223,12 +233,13 @@ class FrankaStarWorldsDemo:
             goal=goal_2d,
             obstacle_proxies=result.proxies
         )
-        
+
         if path_2d is None:
-            print(f"  RRT failed to find path")
+            print(f"  RRT failed to find path — check proxy coverage and start/goal positions")
             return None
-        
-        print(f"  Path found with {len(path_2d)} waypoints")
+
+        print(f"  Path found: {len(path_2d)} waypoints, "
+              f"length={sum(np.linalg.norm(path_2d[k+1]-path_2d[k]) for k in range(len(path_2d)-1)):.3f} m")
         
         # Convert 2D path back to 3D by interpolating Z between start and goal
         path_3d = self._lift_path_to_3d(path_2d, start_3d[2], goal_3d[2])

@@ -33,25 +33,31 @@ def get_scenario(name='simple'):
 
 
 def simple_scenario():
-    """3 obstacles - easy navigation."""
+    """3 obstacles - easy navigation.
+
+    Path from start [0.22, -0.45] to goal [0.75, 0.45]:
+      - Obs 0 (red, moving): upper-left region, well clear of goal
+      - Obs 1 (blue, moving): lower region, well clear of start
+      - Obs 2 (green, static): mid-right region, forces path to curve around it
+    """
     return [
         {
-            'radius': 0.10,
+            'radius': 0.08,
             'color': [1, 0, 0, 0.7],
-            'position': [0.35, 0.45, 0.4],
-            'trajectory': lambda t: np.array([0.35, 0.45 + 0.05 * np.sin(t), 0.4])
+            'position': [0.35, 0.30, 0.4],
+            'trajectory': lambda t: np.array([0.35, 0.30 + 0.04 * np.sin(t), 0.4])
+        },
+        {
+            'radius': 0.07,
+            'color': [0, 0, 1, 0.7],
+            'position': [0.42, -0.30, 0.3],
+            'trajectory': lambda t: np.array([0.42 + 0.04 * np.cos(t * 1.5), -0.30, 0.3])
         },
         {
             'radius': 0.08,
-            'color': [0, 0, 1, 0.7],
-            'position': [0.35, -0.45, 0.3],
-            'trajectory': lambda t: np.array([0.35 + 0.05 * np.cos(t * 1.5), -0.45, 0.3])
-        },
-        {
-            'radius': 0.09,
             'color': [0, 1, 0, 0.7],
-            'position': [0.7, 0.1, 0.4],
-            'trajectory': lambda t: np.array([0.7, 0.1, 0.4])  # Static
+            'position': [0.60, 0.05, 0.4],
+            'trajectory': lambda t: np.array([0.60, 0.05, 0.4])  # Static
         },
     ]
 
@@ -145,8 +151,8 @@ def corridor_scenario():
 # Predefined start/goal positions for each scenario
 SCENARIO_WAYPOINTS = {
     'simple': {
-        'start': [0.22, -0.45, 0.4],  # Further bottom-left
-        'goal': [0.75, 0.45, 0.4]     # Further top-right
+        'start': [0.25, -0.50, 0.4],  # Bottom-left, clear of obstacles
+        'goal': [0.72, 0.48, 0.4]     # Top-right, clear of obstacles
     },
     'moderate': {
         'start': [0.22, -0.48, 0.4],  # Bottom-left, clear of obstacles
