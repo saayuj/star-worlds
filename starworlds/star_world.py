@@ -422,9 +422,13 @@ def create_star_world_3d(
                 early_exit = True
                 break
 
-            # Kernel: tetrahedron at cluster centroid
+            # Kernel: tetrahedron at cluster centroid, nudged off l(x,xg)
+            # l(x,xg) avoidance is handled inside select_kernel_3d (3-D
+            # analogue of Algorithm 3 §V-C).  The shift is proportional to
+            # the hull's mean radius so the kernel stays near the centroid.
             prev_k = prev_centroids.get(frozenset(cl_list))
-            K, kc = select_kernel_3d(cluster_hull, k_prev_centroid=prev_k)
+            K, kc = select_kernel_3d(cluster_hull, k_prev_centroid=prev_k,
+                                     x=x, xg=xg)
             if K is None:
                 early_exit = True
                 break

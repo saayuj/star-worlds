@@ -1,25 +1,25 @@
 """
 PyBullet + Franka Panda + Star-Worlds + Reactive Controller demo.
 
-Architecture
-------------
-1. Franka Panda arm is loaded in PyBullet.
-2. Sphere obstacles (static or dynamic) are created from a chosen scenario.
-3. At each control cycle (~20 Hz):
-   a. Star-worlds algorithm (Algorithm 2, 3-D) reshapes obstacle spheres into
-      disjoint star-shaped proxies, each carrying a kernel center x_{c,i}.
-   b. A modulation-based reactive controller (Huber et al. 2019/2022) uses
-      those kernel centers to compute a 3-D EE velocity that steers the arm
-      toward the goal while staying outside every proxy boundary.
-   c. The velocity is integrated one step to get an IK target; the arm tracks
-      it via PyBullet position control.
-4. The loop runs at 240 Hz physics / 20 Hz planning. The GUI stays open until
-   the user closes it or presses Ctrl+C.
+Two modes
+---------
+Default (star-worlds ON):
+    Star-worlds algorithm (Algorithm 2, 3-D) reshapes sphere obstacles into
+    disjoint star-shaped proxies.  The Huber modulation controller uses the
+    proxy kernel centres x_{c,i} to compute a collision-free EE velocity.
+
+Raw mode (--raw, star-worlds OFF):
+    Algorithm 2 is skipped entirely.  The Huber controller modulates directly
+    against the raw sphere obstacles (one proxy per sphere, centre = sphere
+    centre).  This is the naive baseline that gets stuck in local minima when
+    obstacles overlap.
 
 Usage
 -----
-    python examples/franka_pybullet_demo.py [--scenario simple|moderate|corridor]
-    python examples/franka_pybullet_demo.py --no-gui
+    python examples/franka_pybullet_demo.py --scenario overlap          # star-worlds ON
+    python examples/franka_pybullet_demo.py --scenario overlap --raw    # naive baseline
+    python examples/franka_pybullet_demo.py --scenario simple
+    python examples/franka_pybullet_demo.py --no-gui --scenario test
 """
 
 import argparse
@@ -32,7 +32,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from starworlds import StarWorldUpdater, Ellipsoid
+from starworlds import StarWorldUpdater, Ellipsoid, ObstacleProxy
 from starworlds.reactive_controller import ReactiveController
 from examples.obstacle_scenarios import get_scenario, SCENARIO_WAYPOINTS
 
@@ -50,8 +50,14 @@ class FrankaStarWorldsDemo:
     PHYSICS_HZ = 240
     CONTROL_DIVIDER = 6           # velocity update:    240/6  = 40 Hz
     SW_UPDATE_DIVIDER = 60        # star-world rebuild:  240/60 =  4 Hz
+    VIZ_UPDATE_DIVIDER = 240      # wireframe redraw:   240/240 =  1 Hz
+    # Proxy wireframe uses addUserDebugLine which is a synchronous PyBullet
+    # call.  A hull with ~60 edges redrawn at 4 Hz noticeably slows the loop.
+    # Dropping viz to 1 Hz is invisible to the eye but cuts the overhead 4×.
 
-    def __init__(self, use_gui: bool = True, scenario: str = 'simple') -> None:
+    def __init__(self, use_gui: bool = True, scenario: str = 'simple',
+                 use_raw: bool = False) -> None:
+        self.use_raw = use_raw          # True → bypass Algorithm 2 (naive baseline)
         # ── PyBullet setup ────────────────────────────────────────────────────
         self.physics_client = p.connect(p.GUI if use_gui else p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -78,8 +84,8 @@ class FrankaStarWorldsDemo:
             v_max=0.30,
             eta=1.0,
             weight_power=2.0,
-            safety_radius=0.03,
-            goal_tolerance=0.05,
+            safety_radius=0.01,   # small; obstacles already inflated +5 cm in Alg.2
+            goal_tolerance=0.02,  # 2 cm — tight; checked at 40 Hz so not missed
         )
 
         # ── Workspace bounds (used to clamp IK targets) ───────────────────────
@@ -87,7 +93,8 @@ class FrankaStarWorldsDemo:
         self.ws_upper = np.array([0.95,  0.75, 0.90])
 
         # ── Visualisation book-keeping ────────────────────────────────────────
-        self.proxy_visual_ids: list = []
+        self.proxy_visual_ids: list = []   # createMultiBody IDs (kernel dots)
+        self.proxy_line_ids:   list = []   # addUserDebugLine IDs (hull wireframe)
         self.trace_line_ids:   list = []
         self._vel_arrow_id:    int  = -1
         self._prev_ee: np.ndarray | None = None
@@ -117,12 +124,24 @@ class FrankaStarWorldsDemo:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _create_obstacles_from_scenario(self, scenario_name: str) -> list:
+        """
+        Create obstacles as VISUAL-ONLY bodies (no collision geometry).
+
+        Passing baseCollisionShapeIndex=-1 tells PyBullet to render the sphere
+        but not register it in the physics engine.  The robot arm can therefore
+        pass through it physically, eliminating spurious body-link collisions
+        that previously corrupted the EE trajectory.
+
+        All star-worlds and reactive-controller computations are unaffected:
+        obstacle positions are still queried via getBasePositionAndOrientation
+        and passed to Algorithm 2 / the modulation controller exactly as before.
+        """
         obs_list = []
         for cfg in get_scenario(scenario_name):
             vis = p.createVisualShape(p.GEOM_SPHERE, radius=cfg['radius'],
                                       rgbaColor=cfg['color'])
-            col = p.createCollisionShape(p.GEOM_SPHERE, radius=cfg['radius'])
-            body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
+            # baseCollisionShapeIndex=-1  →  visual only, no physics collision
+            body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1,
                                      baseVisualShapeIndex=vis,
                                      basePosition=cfg['position'])
             obs_list.append({'id': body, 'radius': cfg['radius'],
@@ -165,6 +184,41 @@ class FrankaStarWorldsDemo:
                 force=1000,
             )
 
+    def _get_raw_proxies(self) -> list:
+        """
+        Build one fake ObstacleProxy per sphere using the sphere's *actual*
+        centre as the repulsion centre — no star-world reshaping.
+
+        This is the naive baseline: overlapping spheres each push outward from
+        their own centres.  When two spheres overlap the +y and -y normals
+        cancel while the goal-directed x component is suppressed → local minimum.
+        """
+        proxies = []
+        for i, obs in enumerate(self.obstacles):
+            pos, _ = p.getBasePositionAndOrientation(obs['id'])
+            c = np.array(pos)
+            r = obs['radius'] + 0.05
+
+            # Fibonacci sphere surface (same resolution as n_approx_3d=16)
+            n   = 16
+            idx = np.arange(n)
+            phi   = np.arccos(1 - 2 * (idx + 0.5) / n)
+            theta = np.pi * (1 + np.sqrt(5)) * idx
+            pts   = c + r * np.column_stack([
+                np.sin(phi) * np.cos(theta),
+                np.sin(phi) * np.sin(theta),
+                np.cos(phi),
+            ])
+
+            proxies.append(ObstacleProxy(
+                pieces=[pts],
+                kernel_K=None,
+                center_point=c,      # raw sphere centre, NOT an Algorithm-2 kernel
+                original_indices=[i],
+                is_fallback=False,
+            ))
+        return proxies
+
     def _move_to_start(self, target: np.ndarray, max_steps: int = 1200,
                         tol: float = 0.03) -> None:
         """Drive the arm to `target` and wait for arrival (blocking)."""
@@ -181,7 +235,19 @@ class FrankaStarWorldsDemo:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _visualize_proxies(self, proxies: list) -> None:
-        """Re-draw proxy centres (solid green) and bounding spheres (ghost)."""
+        """
+        Re-draw proxy visualisation using the ACTUAL convex hull wireframe.
+
+        For each proxy:
+          • Small solid green dot at the kernel centre (center_point).
+          • Green wireframe of the true 3-D convex hull of proxy.pieces —
+            one line per unique hull edge via scipy.spatial.ConvexHull.
+
+        This shows the genuine star-shaped proxy boundary (a capsule/lens
+        for two merged sphere obstacles), not a sphere approximation.
+        """
+        from scipy.spatial import ConvexHull
+
         for vid in self.proxy_visual_ids:
             try:
                 p.removeBody(vid)
@@ -189,25 +255,51 @@ class FrankaStarWorldsDemo:
                 pass
         self.proxy_visual_ids.clear()
 
+        for lid in self.proxy_line_ids:
+            try:
+                p.removeUserDebugItem(lid)
+            except Exception:
+                pass
+        self.proxy_line_ids.clear()
+
         for proxy in proxies:
-            xc = proxy.center_point.tolist()
-            # Small solid green sphere at kernel center
-            vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.02,
-                                      rgbaColor=[0, 1, 0, 1])
+            xc = np.array(proxy.center_point)
+
+            # ── Kernel centre: small solid bright-green dot ───────────────────
+            vis_dot = p.createVisualShape(p.GEOM_SPHERE, radius=0.025,
+                                          rgbaColor=[0, 1.0, 0, 1])
             self.proxy_visual_ids.append(
-                p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis,
-                                  basePosition=xc))
-            # Transparent bounding sphere
-            if proxy.pieces:
-                all_pts = np.vstack(proxy.pieces)
-                r = float(np.max(np.linalg.norm(all_pts - proxy.center_point,
-                                                 axis=1)))
-                if r > 0.01:
-                    vis2 = p.createVisualShape(p.GEOM_SPHERE, radius=r,
-                                               rgbaColor=[0, 1, 0, 0.12])
-                    self.proxy_visual_ids.append(
-                        p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis2,
-                                          basePosition=xc))
+                p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis_dot,
+                                  basePosition=xc.tolist()))
+
+            if not proxy.pieces:
+                continue
+
+            all_pts = np.vstack(proxy.pieces)
+            if len(all_pts) < 4:
+                continue
+
+            # ── Convex hull wireframe ─────────────────────────────────────────
+            try:
+                hull = ConvexHull(all_pts)
+            except Exception:
+                continue
+
+            # Each simplex is a triangle; collect unique edges to avoid
+            # drawing every shared edge twice.
+            edges: set = set()
+            for simplex in hull.simplices:
+                for i in range(3):
+                    edges.add(tuple(sorted((simplex[i], simplex[(i + 1) % 3]))))
+
+            for i, j in edges:
+                lid = p.addUserDebugLine(
+                    all_pts[i].tolist(),
+                    all_pts[j].tolist(),
+                    lineColorRGB=[0, 0.85, 0.25],
+                    lineWidth=1.5,
+                )
+                self.proxy_line_ids.append(lid)
 
     def _draw_velocity_arrow(self, x: np.ndarray, v: np.ndarray) -> None:
         """Draw a short line in the direction of the current EE velocity."""
@@ -303,13 +395,19 @@ class FrankaStarWorldsDemo:
         current_proxies: list = []
         current_velocity = np.zeros(3)
 
-        # ── Initial star-world update ──────────────────────────────────────────
+        # ── Initial proxy computation ──────────────────────────────────────────
+        mode_label = "RAW (no star-worlds)" if self.use_raw else "Star-Worlds (Algorithm 2)"
+        print(f"\nMode: {mode_label}")
         x_now = self.get_ee_position()
         self.update_obstacle_positions(0.0)
-        obs_3d = self.get_starworld_obstacles_3d()
-        result = self.star_updater.update(obs_3d, x_now, goal)
-        current_proxies = result.proxies
-        self._visualize_proxies(current_proxies)
+        if self.use_raw:
+            current_proxies = self._get_raw_proxies()
+            # Raw mode: no star-worlds → no proxy visualization
+        else:
+            obs_3d = self.get_starworld_obstacles_3d()
+            result = self.star_updater.update(obs_3d, x_now, goal)
+            current_proxies = result.proxies
+            self._visualize_proxies(current_proxies)
 
         while p.isConnected():
             # ── Physics step (every iteration, 240 Hz) ─────────────────────────
@@ -334,31 +432,7 @@ class FrankaStarWorldsDemo:
                 self._draw_velocity_arrow(x_now, current_velocity)
                 self._trace_ee(x_now)
 
-            # ── Star-world rebuild (every SW_UPDATE_DIVIDER steps, 4 Hz) ───────
-            # Separated from the velocity loop so the physics loop is only
-            # blocked ~3 ms every 0.25 s (< 1.2 % overhead).
-            if step % self.SW_UPDATE_DIVIDER == 0:
-                self.update_obstacle_positions(t)
-                obs_3d = self.get_starworld_obstacles_3d()
-                result = self.star_updater.update(obs_3d, x_now, goal)
-                current_proxies = result.proxies
-                self._visualize_proxies(current_proxies)
-
-                # ── Terminal report ────────────────────────────────────────────
-                if t - last_report >= report_interval:
-                    dist = float(np.linalg.norm(x_now - goal))
-                    gammas_str = ""
-                    if current_proxies:
-                        gs = [self.controller._gamma(x_now, px)
-                              for px in current_proxies]
-                        gammas_str = " | Γ=[" + " ".join(f"{g:.2f}" for g in gs) + "]"
-                    speed = float(np.linalg.norm(current_velocity))
-                    print(f"t={t:5.1f}s | EE={np.round(x_now,3)} | "
-                          f"dist={dist:.3f} m | v={speed:.3f} m/s | "
-                          f"proxies={len(current_proxies)}{gammas_str}")
-                    last_report = t
-
-                # ── Goal check ─────────────────────────────────────────────────
+                # ── Goal check at control rate (40 Hz) so we don't overshoot ──
                 dist_to_goal = float(np.linalg.norm(x_now - goal))
                 if dist_to_goal < self.controller.goal_tolerance:
                     goal_reached = True
@@ -372,6 +446,34 @@ class FrankaStarWorldsDemo:
                     print(f"\n⚠  Time limit reached ({max_sim_time:.0f}s).  "
                           f"dist_to_goal={dist:.3f} m")
                     break
+
+            # ── Proxy rebuild (every SW_UPDATE_DIVIDER steps, 4 Hz) ───────────
+            if step % self.SW_UPDATE_DIVIDER == 0:
+                self.update_obstacle_positions(t)
+                if self.use_raw:
+                    current_proxies = self._get_raw_proxies()
+                else:
+                    obs_3d = self.get_starworld_obstacles_3d()
+                    result = self.star_updater.update(obs_3d, x_now, goal)
+                    current_proxies = result.proxies
+                    # Wireframe redrawn at VIZ_UPDATE_DIVIDER (1 Hz), not every
+                    # SW rebuild (4 Hz), to keep the physics loop responsive.
+                    if step % self.VIZ_UPDATE_DIVIDER == 0:
+                        self._visualize_proxies(current_proxies)
+
+                # ── Terminal report ────────────────────────────────────────────
+                if t - last_report >= report_interval:
+                    dist = float(np.linalg.norm(x_now - goal))
+                    gammas_str = ""
+                    if current_proxies and not self.use_raw:
+                        gs = [self.controller._gamma(x_now, px)
+                              for px in current_proxies]
+                        gammas_str = " | Γ=[" + " ".join(f"{g:.2f}" for g in gs) + "]"
+                    speed = float(np.linalg.norm(current_velocity))
+                    print(f"t={t:5.1f}s | EE={np.round(x_now,3)} | "
+                          f"dist={dist:.3f} m | v={speed:.3f} m/s | "
+                          f"proxies={len(current_proxies)}{gammas_str}")
+                    last_report = t
 
         if not goal_reached and p.isConnected():
             x_final = self.get_ee_position()
@@ -405,16 +507,20 @@ if __name__ == "__main__":
         description='Franka + Star-Worlds + Reactive Controller Demo'
     )
     parser.add_argument('--scenario', type=str, default='test',
-                        choices=['test', 'simple', 'moderate', 'corridor'],
+                        choices=['overlap', 'test', 'simple', 'moderate', 'corridor'],
                         help='Obstacle scenario to use')
     parser.add_argument('--no-gui', action='store_true',
                         help='Run without GUI (headless)')
+    parser.add_argument('--raw', action='store_true',
+                        help='Naive baseline: skip star-worlds, modulate against '
+                             'raw sphere centres (shows local-minimum failure)')
     args = parser.parse_args()
 
     demo = None
     try:
         demo = FrankaStarWorldsDemo(use_gui=not args.no_gui,
-                                    scenario=args.scenario)
+                                    scenario=args.scenario,
+                                    use_raw=args.raw)
         demo.run_demo()
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

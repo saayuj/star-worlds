@@ -149,19 +149,50 @@ class ReactiveController:
         """
         Normalised distance measure: Γ = 1 on proxy boundary, > 1 outside.
 
-        Uses the bounding radius of the proxy hull to scale the distance from
-        the proxy's kernel center point, giving a spherically symmetric Gamma.
-        For sphere proxies (the typical case) this is exact.
+        Uses the DIRECTION-DEPENDENT radius r(d) = support function of the
+        proxy hull in the direction d = (x - c)/||x - c||.  This is the
+        distance from the kernel centre c to the proxy boundary *in the
+        direction of x*, making Gamma exact for any convex proxy shape —
+        not just spheres.
+
+        Contrast with the naive bounding-sphere radius (max over all vertices)
+        which always overestimates and makes the robot "feel" the proxy from
+        too far away.
         """
         c = proxy.center_point
-        r = self._bounding_radius(proxy) + self.safety_radius
+        r = self._radius_in_direction(proxy, x) + self.safety_radius
         if r < 1e-10:
             return 10.0
         d = float(np.linalg.norm(x - c))
         return max(d / r, 1e-3)
 
+    def _radius_in_direction(self, proxy, x: np.ndarray) -> float:
+        """
+        Support function of the proxy hull in the direction (x - c).
+
+        For a convex set, the boundary in direction d̂ lies at distance
+        max_v { (v - c) · d̂ } from c.  This gives a direction-dependent
+        radius that is always ≤ the naive bounding radius.
+
+        For a union of convex pieces (the star-world case) we take the max
+        over all pieces — the union's boundary in direction d̂ is the
+        outermost piece boundary in that direction.
+        """
+        c = proxy.center_point
+        d = x - c
+        d_norm = float(np.linalg.norm(d))
+        if d_norm < 1e-10:
+            return self._bounding_radius(proxy)
+        d_unit = d / d_norm
+        if not proxy.pieces:
+            return 0.1
+        all_pts = np.vstack(proxy.pieces)
+        # Support function: project all hull vertices onto d̂, take max
+        projections = (all_pts - c) @ d_unit
+        return float(max(float(np.max(projections)), 0.05))
+
     def _bounding_radius(self, proxy) -> float:
-        """Max distance from proxy center to any hull vertex."""
+        """Max distance from proxy center to any hull vertex (for visualisation)."""
         if not proxy.pieces:
             return 0.1
         all_pts = np.vstack(proxy.pieces)

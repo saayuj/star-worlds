@@ -62,25 +62,28 @@ star-worlds/
 ### Franka arm — 3-D PyBullet demo
 
 ```bash
-python examples/franka_pybullet_demo.py                       # default: test scenario
+python examples/franka_pybullet_demo.py                          # default: test scenario
 python examples/franka_pybullet_demo.py --scenario simple
 python examples/franka_pybullet_demo.py --scenario moderate
 python examples/franka_pybullet_demo.py --scenario corridor
-python examples/franka_pybullet_demo.py --no-gui --scenario simple   # headless
+python examples/franka_pybullet_demo.py --scenario overlap        # star-worlds ON
+python examples/franka_pybullet_demo.py --scenario overlap --raw  # naive baseline (no star-worlds)
+python examples/franka_pybullet_demo.py --no-gui --scenario test  # headless
 ```
 
 Each run:
-1. Opens the PyBullet GUI and loads the Franka Panda with sphere obstacles
+1. Opens the PyBullet GUI and loads the Franka Panda with sphere obstacles (visual-only — no physics collision, so the arm passes through freely and EE trajectory reflects the algorithm purely)
 2. Pauses — **press Enter in the terminal** to start the simulation
 3. Moves the arm to the start position via IK
 4. Enters the reactive control loop:
    - **40 Hz**: reads current EE position, computes modulated velocity from star-world proxies, advances IK target
    - **4 Hz**: rebuilds the disjoint star world from current obstacle positions (supports dynamic obstacles)
-5. Reports goal distance in the terminal every second; stays open until goal is reached, then until you close the window or press Ctrl+C
+   - **1 Hz**: redraws proxy wireframe (decoupled from control to keep the loop responsive)
+5. Reports goal distance and Gamma values in the terminal every second; stays open until goal is reached, then until you close the window or press Ctrl+C
 
 GUI overlays:
-- **Green dot**: kernel center x_{c,i} of each proxy (the interior point the modulation uses)
-- **Transparent green sphere**: proxy bounding volume
+- **Bright green dot**: kernel center x_{c,i} of each proxy
+- **Green wireframe cage**: actual 3-D convex hull boundary of the star-shaped proxy (one cage per merged cluster — shows the true capsule/lens shape, not a sphere approximation)
 - **Orange arrow**: current EE velocity direction
 - **White trail**: EE path traced so far
 - **Green/red dots**: start and goal markers
@@ -88,9 +91,10 @@ GUI overlays:
 | Scenario | Obstacles | Notes |
 |---|---|---|
 | `test` | 1 static | Minimal sanity check — single sphere on direct path |
-| `simple` | 3 (2 moving, 1 static) | Easy — 3 separate proxies |
+| `simple` | 4 (2 moving, 2 small static) | Two small static spheres merge into one star-world proxy; 2 dynamic obstacles have independent proxies |
 | `moderate` | 6 (5 moving, 1 static) | Medium — some clusters may merge |
-| `corridor` | 18 (16 static walls + 2 moving) | Hard — large merged proxy |
+| `corridor` | 7 (6 static walls + 1 moving blocker) | Arm navigates narrow passage |
+| `overlap` | 2 static (overlapping) | **Before/after comparison**: `--raw` shows naive failure (arm penetrates), default shows star-worlds success (arm arcs around merged proxy) |
 
 ### 2-D visualisation examples
 
@@ -98,6 +102,7 @@ GUI overlays:
 python examples/2d_static.py          # before/after star-world construction
 python examples/2d_dynamic.py         # animated moving obstacles
 python examples/2d_dynamic.py --save  # save as dynamic_result.gif
+python examples/2d_comparison.py      # side-by-side: naive failure vs star-worlds success → 2d_comparison.png
 ```
 
 ---

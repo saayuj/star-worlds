@@ -108,11 +108,17 @@ def select_kernel_3d(
     eps_frac: float = 0.10,
     eps_min: float = 1e-4,
     k_prev_centroid: Optional[np.ndarray] = None,
+    x: Optional[np.ndarray] = None,
+    xg: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Select a regular tetrahedron K (4 × 3) as the 3-D kernel for a cluster.
 
-    The centroid of the tetrahedron is placed at the cluster-hull centroid.
+    The centroid is placed at the cluster-hull centroid, then nudged off the
+    line l(x, xg) if necessary (3-D analogue of Algorithm 3 §V-C).  The nudge
+    is proportional to the hull's mean radius (not a fixed distance) so the
+    kernel stays near the geometric centre even for small clusters.
+
     Temporal coherence: if *k_prev_centroid* is close to the cluster, reuse it.
 
     Parameters
@@ -121,6 +127,8 @@ def select_kernel_3d(
     eps_frac         : tetrahedron circumradius = eps_frac × mean hull radius.
     eps_min          : absolute minimum circumradius.
     k_prev_centroid  : centroid from the previous timestep.
+    x                : current robot EE position (for l(x,xg) avoidance).
+    xg               : goal position (for l(x,xg) avoidance).
 
     Returns
     -------
@@ -132,15 +140,35 @@ def select_kernel_3d(
 
     pts = np.asarray(cluster_hull_pts, dtype=float)
     centroid = polygon_centroid_3d(pts)
+    mean_r = float(np.mean(np.linalg.norm(pts - centroid, axis=1)))
 
     # Temporal coherence: reuse previous centroid if it's close enough
     if k_prev_centroid is not None:
         k_prev = np.asarray(k_prev_centroid, dtype=float)
-        mean_r = float(np.mean(np.linalg.norm(pts - centroid, axis=1)))
         if np.linalg.norm(k_prev - centroid) < 0.8 * mean_r:
             centroid = k_prev
+            mean_r = float(np.mean(np.linalg.norm(pts - centroid, axis=1)))
 
-    mean_r = float(np.mean(np.linalg.norm(pts - centroid, axis=1)))
+    # ── l(x, xg) avoidance (3-D analogue of Algorithm 3 §V-C) ────────────────
+    # The kernel must not lie on l(x,xg) or the tangential modulation term is
+    # zero → local minimum.  If the centroid is too close to the line, nudge it
+    # perpendicular by 25% of the cluster's mean radius.  This keeps the kernel
+    # near the geometric centre while guaranteeing non-zero tangential force.
+    if x is not None and xg is not None:
+        l_dir = np.asarray(xg, dtype=float) - np.asarray(x, dtype=float)
+        l_len = float(np.linalg.norm(l_dir))
+        if l_len > 1e-10:
+            l_unit = l_dir / l_len
+            t = float(np.dot(centroid - x, l_unit))
+            proj = np.asarray(x, dtype=float) + t * l_unit
+            dist_from_line = float(np.linalg.norm(centroid - proj))
+            threshold = 0.01 * mean_r if mean_r > 1e-6 else 1e-4
+            if dist_from_line < threshold:
+                perp = np.cross(l_unit, np.array([0.0, 0.0, 1.0]))
+                perp_n = float(np.linalg.norm(perp))
+                if perp_n > 1e-10:
+                    centroid = centroid + (0.25 * mean_r) * perp / perp_n
+
     eps = max(eps_frac * mean_r, eps_min)
     K = regular_tetrahedron_3d(centroid, eps)
     return K, centroid
