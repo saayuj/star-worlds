@@ -141,6 +141,41 @@ class ReactiveController:
     def goal_reached(self, x: np.ndarray, xg: np.ndarray) -> bool:
         return float(np.linalg.norm(np.asarray(x) - np.asarray(xg))) < self.goal_tolerance
 
+    def arm_clearances(
+        self,
+        arm_points: list,
+        proxies: list,
+    ) -> list:
+        """
+        Batch Gamma query for a list of arm sample points.
+
+        Parameters
+        ----------
+        arm_points : list of (3,) world-space positions along the arm.
+        proxies    : list of ObstacleProxy from StarWorldUpdater.
+
+        Returns
+        -------
+        List of (gamma_min, closest_proxy_idx, unit_repulsion_vec) —
+        one entry per arm point.  gamma_min = inf and repulsion = zeros
+        when there are no proxies.
+        """
+        results = []
+        for xp in arm_points:
+            xp = np.asarray(xp, dtype=float)
+            if not proxies:
+                results.append((float('inf'), -1, np.zeros(3)))
+                continue
+            gammas = [self._gamma(xp, pr) for pr in proxies]
+            idx_min = int(np.argmin(gammas))
+            g_min   = gammas[idx_min]
+            c = np.asarray(proxies[idx_min].center_point, dtype=float)
+            d = xp - c
+            d_norm = float(np.linalg.norm(d))
+            rep = (d / d_norm) if d_norm > 1e-8 else np.zeros(3)
+            results.append((g_min, idx_min, rep))
+        return results
+
     # ------------------------------------------------------------------
     # Γ function
     # ------------------------------------------------------------------

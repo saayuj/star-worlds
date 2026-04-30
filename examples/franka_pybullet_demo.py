@@ -13,13 +13,6 @@ Raw mode (--raw, star-worlds OFF):
     against the raw sphere obstacles (one proxy per sphere, centre = sphere
     centre).  This is the naive baseline that gets stuck in local minima when
     obstacles overlap.
-
-Usage
------
-    python examples/franka_pybullet_demo.py --scenario overlap          # star-worlds ON
-    python examples/franka_pybullet_demo.py --scenario overlap --raw    # naive baseline
-    python examples/franka_pybullet_demo.py --scenario simple
-    python examples/franka_pybullet_demo.py --no-gui --scenario test
 """
 
 import argparse
@@ -51,9 +44,40 @@ class FrankaStarWorldsDemo:
     CONTROL_DIVIDER = 6           # velocity update:    240/6  = 40 Hz
     SW_UPDATE_DIVIDER = 60        # star-world rebuild:  240/60 =  4 Hz
     VIZ_UPDATE_DIVIDER = 240      # wireframe redraw:   240/240 =  1 Hz
-    # Proxy wireframe uses addUserDebugLine which is a synchronous PyBullet
-    # call.  A hull with ~60 edges redrawn at 4 Hz noticeably slows the loop.
-    # Dropping viz to 1 Hz is invisible to the eye but cuts the overhead 4×.
+
+    # ── Full-arm collision avoidance (APF + null-space IK biasing) ──────────
+    # ALL 9 Franka links are monitored (joints 0–8).
+    # Each link is approximated as a capsule: we sample it at fractions
+    # [0.0, 0.5, 1.0] along the segment between consecutive joint origins.
+    # Fraction 0.0 = this joint's origin; 1.0 = next joint's origin (owned
+    # by the child link but attributed to the parent for the Jacobian).
+    # Link 8 (panda_hand) uses [0.0, 0.5] only — EE covers the tip.
+    #   joint  0 → panda_link1   (shoulder)
+    #   joint  1 → panda_link2   (upper-arm)
+    #   joint  2 → panda_link3   (elbow-upper)
+    #   joint  3 → panda_link4   (elbow-lower)
+    #   joint  4 → panda_link5   (forearm)
+    #   joint  5 → panda_link6   (pre-wrist)
+    #   joint  6 → panda_link7   (wrist)
+    #   joint  7 → panda_link8   (fixed — hand base)
+    #   joint  8 → panda_hand    (fixed — palm)
+    ARM_MONITOR_LINK_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    ARM_CAPSULE_FRACTIONS    = [0.0, 0.5, 1.0]   # fractions along each link segment
+    # Physical radius of each monitored link [m] — used to compute Gamma relative
+    # to the link's actual surface, not its centre-line.
+    # Franka Panda approximate collision radii from URDF:
+    ARM_LINK_RADII = {
+        0: 0.06, 1: 0.06, 2: 0.06, 3: 0.06,
+        4: 0.05, 5: 0.05, 6: 0.04, 7: 0.03, 8: 0.04,
+    }
+    ARM_GAMMA_THRESHOLD = 1.6   # Gamma threshold relative to link surface
+                                # (Gamma=1 → link surface at proxy boundary)
+    ARM_CORRECTION_GAIN = 0.30  # Jacobian-transpose APF gain
+    ARM_POSTURE_GAIN    = 0.08  # null-space posture attraction gain
+    ARM_EMA_ALPHA       = 0.10  # EMA smoothing: smaller = smoother/slower
+    ARM_MAX_NS_NORM     = 0.07  # max L2 norm of null-space step [rad]
+    # Nominal Franka posture: elbow-up, reach-forward — prevents weird flips
+    Q_NOMINAL = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.8, 0.785])
 
     def __init__(self, use_gui: bool = True, scenario: str = 'simple',
                  use_raw: bool = False) -> None:
@@ -67,6 +91,15 @@ class FrankaStarWorldsDemo:
         # ── Robot ─────────────────────────────────────────────────────────────
         self.franka_id = self._load_franka()
         self.ee_link_index = 11          # panda_hand link
+
+        # Pre-compute movable-joint list once (FIXED joints excluded from
+        # PyBullet Jacobian DOF count; invariant across the simulation).
+        nj_total = p.getNumJoints(self.franka_id)
+        self._movable_joints: list = [
+            ji for ji in range(nj_total)
+            if p.getJointInfo(self.franka_id, ji)[2] != p.JOINT_FIXED
+        ]
+        self._movable_dof: int = len(self._movable_joints)
 
         # ── Scenario ──────────────────────────────────────────────────────────
         self.scenario_name = scenario
@@ -98,6 +131,15 @@ class FrankaStarWorldsDemo:
         self.trace_line_ids:   list = []
         self._vel_arrow_id:    int  = -1
         self._prev_ee: np.ndarray | None = None
+        # Raw APF joint-space correction Δq and its EMA-smoothed version.
+        # _nullspace_correction writes _arm_q_corr; _apply_ik reads
+        # _arm_q_corr_smooth (updated via EMA each control step).
+        self._arm_q_corr:        np.ndarray | None = None
+        self._arm_q_corr_smooth: np.ndarray        = np.zeros(7)
+        # Cached joint-state list (all movable joints) written once per control
+        # step in _nullspace_correction and reused in _apply_ik to avoid a
+        # second round of getJointState calls.
+        self._last_q_list: list | None = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Robot loading
@@ -170,17 +212,274 @@ class FrankaStarWorldsDemo:
         state = p.getLinkState(self.franka_id, self.ee_link_index)
         return np.array(state[0])
 
+    def _get_arm_collision_points(self) -> list:
+        """
+        Return [(world_pos, link_idx, local_offset), ...] for all arm sample
+        points.  Each link is modelled as a capsule sampled at
+        ARM_CAPSULE_FRACTIONS along the segment from this joint's world origin
+        to the next joint's world origin.
+
+        local_offset is expressed in the link's own frame so it can be passed
+        directly to p.calculateJacobian.  For fraction 0.0 it is [0,0,0];
+        for fractions > 0 it is R_i^T (frac*(p_{i+1} - p_i)).
+
+        Perf: origins/quats fetched via a single getLinkStates call (one
+        C-extension round-trip instead of N); quat→matrix fully vectorised
+        with numpy broadcasting; inner fraction loop uses pre-computed segs.
+        """
+        indices = self.ARM_MONITOR_LINK_INDICES
+        n_links = len(indices)
+
+        # ── Single batch FK query ──────────────────────────────────────────
+        states = p.getLinkStates(self.franka_id, indices,
+                                  computeForwardKinematics=True)
+        # state[4] = worldLinkFramePosition, state[5] = orientation (xyzw)
+        origins = np.array([s[4] for s in states], dtype=float)  # (N,3)
+        quats   = np.array([s[5] for s in states], dtype=float)  # (N,4) xyzw
+
+        # ── Vectorised quat → rotation matrices ───────────────────────────
+        # quats columns: x y z w
+        x, y, z, w = quats[:,0], quats[:,1], quats[:,2], quats[:,3]
+        # Build (N,3,3) rotation matrices without any Python loops
+        Rs = np.empty((n_links, 3, 3), dtype=float)
+        Rs[:,0,0] = 1 - 2*(y*y + z*z);  Rs[:,0,1] = 2*(x*y - z*w);  Rs[:,0,2] = 2*(x*z + y*w)
+        Rs[:,1,0] = 2*(x*y + z*w);       Rs[:,1,1] = 1 - 2*(x*x + z*z);  Rs[:,1,2] = 2*(y*z - x*w)
+        Rs[:,2,0] = 2*(x*z - y*w);       Rs[:,2,1] = 2*(y*z + x*w);       Rs[:,2,2] = 1 - 2*(x*x + y*y)
+
+        # ── Segment vectors (p_{i+1} − p_i) ──────────────────────────────
+        segs = np.empty_like(origins)               # (N,3)
+        segs[:-1] = origins[1:] - origins[:-1]
+        segs[-1]  = np.array([0.0, 0.0, 0.05])      # extend last link toward EE
+
+        # ── Build sample points ───────────────────────────────────────────
+        fracs = np.asarray(self.ARM_CAPSULE_FRACTIONS, dtype=float)  # (F,)
+        # world_pos[k,f] = origins[k] + fracs[f]*segs[k]  →  (N,F,3)
+        world_pts = origins[:, None, :] + fracs[None, :, None] * segs[:, None, :]  # (N,F,3)
+        # local_off[k,f] = Rs[k].T @ (fracs[f]*segs[k])  →  (N,F,3)
+        frac_segs  = fracs[None, :, None] * segs[:, None, :]          # (N,F,3)
+        local_offs = np.einsum('nij,nfj->nfi', Rs, frac_segs)         # (N,F,3) via Rᵀ@v = einsum
+
+        points = []
+        for k, li in enumerate(indices):
+            for fi, _ in enumerate(fracs):
+                points.append((
+                    world_pts[k, fi],
+                    li,
+                    local_offs[k, fi].tolist(),
+                ))
+        return points
+
+    def _link_gamma(self, world_pos: np.ndarray, proxy, link_idx: int) -> float:
+        """
+        Compute Gamma for an arm link sample point, accounting for the link's
+        physical radius.
+
+        Standard Gamma = d / r_proxy(dir), where d is distance from the proxy
+        kernel centre and r_proxy is the direction-dependent proxy radius.
+        This treats the link as a zero-radius point: Gamma=1 means the link
+        CENTRE is at the proxy boundary.
+
+        Arm links have physical radius ~4–6 cm.  We extend the effective proxy
+        radius by ARM_LINK_RADII[link_idx] so that:
+            Gamma = 1  ⇒  link SURFACE touching the proxy boundary
+            Gamma > 1  ⇒  link surface outside the proxy
+            Gamma < 1  ⇒  link surface penetrating the proxy
+
+        This makes the threshold ARM_GAMMA_THRESHOLD physically meaningful
+        with respect to the actual collision geometry.
+        """
+        c       = np.asarray(proxy.center_point, dtype=float)
+        # Direction-dependent proxy radius + link physical radius
+        r_proxy = self.controller._radius_in_direction(proxy, world_pos)
+        link_r  = self.ARM_LINK_RADII.get(link_idx, 0.05)
+        r_eff   = r_proxy + link_r
+        if r_eff < 1e-10:
+            return 10.0
+        d = float(np.linalg.norm(world_pos - c))
+        return max(d / r_eff, 1e-3)
+
+    def _nullspace_correction(
+        self,
+        arm_points: list,
+        proxies: list,
+    ) -> np.ndarray | None:
+        """
+        Compute the raw APF joint-space correction Δq for null-space projection.
+
+        Two terms are combined:
+
+        1. APF obstacle repulsion
+           For each capsule sample x_j with Γ_j < ARM_GAMMA_THRESHOLD
+           (where Γ accounts for the link's physical radius via _link_gamma):
+             • Repulsion direction from the star-world proxy kernel centre c_i*
+               (NOT the raw obstacle centre — this respects the proxy geometry).
+             • APF weight: w = (1/(Γ-1) - 1/(Γ_th-1)) / (1/(Γ_th-1)), capped at 5.
+             • Δq += gain_apf · w · J_jᵀ r̂
+
+        2. Posture attraction (null-space damping)
+           Always-on term that gently draws joints toward Q_NOMINAL.
+           Δq += gain_posture · (Q_NOMINAL - q_cur)
+           This prevents the arm from drifting into mechanically disadvantaged
+           configurations (wrist singularities, elbow flips) when repeated
+           APF pushes accumulate.
+
+        Returns the combined Δq (shape (7,)), or None if no link is close to
+        any proxy AND posture error is negligible.
+        """
+        nj_arm   = 7
+        q_list   = [p.getJointState(self.franka_id, ji)[0]
+                    for ji in self._movable_joints]
+        zero_vel = [0.0] * self._movable_dof
+        q_cur    = np.array(q_list[:nj_arm], dtype=float)
+        # Share with _apply_ik to avoid a second getJointState round-trip.
+        self._last_q_list = q_list
+
+        q_corr    = np.zeros(nj_arm)
+        any_close = False
+        apf_denom = max(self.ARM_GAMMA_THRESHOLD - 1.0, 1e-6)
+
+        # ── Precompute proxy geometry (done once, reused for all arm points) ─
+        n_prx = len(proxies)
+        if n_prx == 0:
+            pass  # fall through to posture term
+        else:
+            # proxy_centers: (P,3),  proxy_r_dirs computed per point below
+            proxy_centers = np.array(
+                [proxy.center_point for proxy in proxies], dtype=float
+            )  # (P,3)
+            # Per-proxy link radii contribution (we add it after r_proxy lookup)
+            # link_radii indexed by link_idx, fetched inside the arm_points loop.
+
+            # ── Term 1: APF obstacle repulsion ─────────────────────────────
+            # Jacobians cached by link_idx (same J for all fractions of same link
+            # that share the same local_off are cached by (link_idx, frac_tuple)).
+            _jac_cache: dict = {}
+
+            for (world_pos, link_idx, local_off) in arm_points:
+                link_r = self.ARM_LINK_RADII.get(link_idx, 0.05)
+
+                # Vectorised gamma for ALL proxies at once ──────────────────
+                # d_vecs: (P,3),  d_norms: (P,)
+                d_vecs  = world_pos[None, :] - proxy_centers        # (P,3)
+                d_norms = np.linalg.norm(d_vecs, axis=1)            # (P,)
+
+                # Direction-dependent proxy radius for each proxy
+                # (calls into Python but unavoidable — one call per proxy)
+                r_proxies = np.array([
+                    self.controller._radius_in_direction(proxy, world_pos)
+                    for proxy in proxies
+                ], dtype=float)                                       # (P,)
+                r_effs = r_proxies + link_r                          # (P,)
+                r_effs = np.maximum(r_effs, 1e-10)
+
+                gammas = np.maximum(d_norms / r_effs, 1e-3)         # (P,)
+
+                # Only process proxies below threshold
+                active = np.where(gammas < self.ARM_GAMMA_THRESHOLD)[0]
+                if active.size == 0:
+                    continue
+                any_close = True
+
+                # Fetch Jacobian once per (link, local_off) combination
+                cache_key = (link_idx, tuple(local_off))
+                if cache_key not in _jac_cache:
+                    Jv, _ = p.calculateJacobian(
+                        self.franka_id, link_idx, local_off,
+                        q_list, zero_vel, zero_vel,
+                    )
+                    _jac_cache[cache_key] = np.array(Jv)[:, :nj_arm]  # (3,7)
+                Jv_arm = _jac_cache[cache_key]   # (3,7)
+
+                for pi in active:
+                    dn = d_norms[pi]
+                    if dn < 1e-8:
+                        continue
+                    repulsion = d_vecs[pi] / dn
+                    g   = gammas[pi]
+                    rho = max(g - 1.0, 1e-4)
+                    weight = min((1.0/rho - 1.0/apf_denom) / (1.0/apf_denom), 5.0)
+                    weight = max(weight, 0.0)
+                    q_corr += self.ARM_CORRECTION_GAIN * weight * (Jv_arm.T @ repulsion)
+
+        # ── Term 2: posture attraction ───────────────────────────────────
+        # Always-on: pulls toward nominal posture in the null space.
+        posture_err = self.Q_NOMINAL - q_cur
+        posture_norm = float(np.linalg.norm(posture_err))
+        if posture_norm > 0.05:   # only apply if noticeably off-nominal
+            q_corr += self.ARM_POSTURE_GAIN * posture_err
+            any_close = True
+
+        return q_corr if any_close else None
+
     def _apply_ik(self, target: np.ndarray) -> None:
-        """Send one IK position-control command."""
-        joint_poses = p.calculateInverseKinematics(
-            self.franka_id, self.ee_link_index, target.tolist()
+        """
+        Command the arm toward `target` EE position with null-space arm avoidance.
+
+        Flow
+        ----
+        1. Read current joint positions q_cur.
+        2. Run IK seeded from q_cur (restPoses=q_cur) so the solver returns
+           the minimal-joint-motion solution — smooth, no discontinuous jumps.
+        3. If avoidance correction is active:
+               J    = EE position Jacobian at q_cur  (3×7)
+               N    = I - J†J   (null-space projector, rank 4)
+               dq_ns = N @ corr_smooth
+               scale dq_ns to norm ≤ ARM_MAX_NS_NORM WITHOUT per-component clip
+               (clipping per-component breaks the null-space property and moves the EE).
+        4. q_cmd = q_ik + dq_ns, clipped to joint limits.
+        """
+        nj_arm = 7
+        ll = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+        ul = np.array([ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973])
+        jr = (ul - ll).tolist()
+
+        # Current joint positions
+        q_cur = np.array([
+            p.getJointState(self.franka_id, ji)[0]
+            for ji in range(nj_arm)
+        ], dtype=float)
+
+        # IK seeded from current joints — minimises joint motion, avoids solution jumps
+        q_ik_all = p.calculateInverseKinematics(
+            self.franka_id, self.ee_link_index, target.tolist(),
+            lowerLimits=ll.tolist(), upperLimits=ul.tolist(),
+            jointRanges=jr, restPoses=q_cur.tolist(),
         )
-        nj = p.getNumJoints(self.franka_id)
-        for ji in range(min(7, nj)):
+        q_ik = np.array(q_ik_all[:nj_arm], dtype=float)
+
+        # Null-space avoidance projection
+        dq_ns = np.zeros(nj_arm)
+        if np.any(self._arm_q_corr_smooth != 0):
+            # Reuse joint state already fetched this step by _nullspace_correction
+            q_list   = self._last_q_list if self._last_q_list is not None else [
+                p.getJointState(self.franka_id, ji)[0] for ji in self._movable_joints
+            ]
+            zero_vel = [0.0] * self._movable_dof
+            Jv_ee, _ = p.calculateJacobian(
+                self.franka_id, self.ee_link_index, [0.0, 0.0, 0.0],
+                q_list, zero_vel, zero_vel,
+            )
+            J = np.array(Jv_ee)[:, :nj_arm]   # (3, 7)
+            J_pinv = np.linalg.pinv(J)
+            N = np.eye(nj_arm) - J_pinv @ J
+            raw_ns = N @ self._arm_q_corr_smooth
+
+            # Scale the whole vector so its norm ≤ ARM_MAX_NS_NORM.
+            # This preserves the null-space direction (J @ raw_ns ≈ 0 still holds)
+            # unlike per-component clipping which breaks the null-space property
+            # and causes the EE to drift.
+            ns_norm = float(np.linalg.norm(raw_ns))
+            if ns_norm > self.ARM_MAX_NS_NORM:
+                raw_ns = raw_ns * (self.ARM_MAX_NS_NORM / ns_norm)
+            dq_ns = raw_ns
+
+        q_cmd = np.clip(q_ik + dq_ns, ll, ul)
+
+        for ji in range(nj_arm):
             p.setJointMotorControl2(
                 self.franka_id, ji,
                 p.POSITION_CONTROL,
-                targetPosition=joint_poses[ji],
+                targetPosition=q_cmd[ji],
                 force=1000,
             )
 
@@ -364,8 +663,8 @@ class FrankaStarWorldsDemo:
         # the scene before anything starts moving.
         print(f"\nStart : {np.round(start, 3)}")
         print(f"Goal  : {np.round(goal, 3)}")
-        print("\nPyBullet window is open.  Press Enter to start the simulation...")
-        input()
+        # print("\nPyBullet window is open.  Press Enter to start the simulation...")
+        # input()
 
         # Move arm to start
         print(f"Moving to start position...")
@@ -429,6 +728,28 @@ class FrankaStarWorldsDemo:
                 x_target = x_now + current_velocity * dt_control
                 x_target = np.clip(x_target, self.ws_lower, self.ws_upper)
 
+                # ── Null-space arm-link correction ────────────────────────────
+                # Sample world positions of monitored arm links and compute a
+                # Jacobian-transpose joint correction that pushes any link
+                # with Γ < ARM_GAMMA_THRESHOLD away from obstacle proxies.
+                # The correction is stored and used by every _apply_ik call
+                # until the next control step (null-space IK biasing).
+                if current_proxies:
+                    arm_pts = self._get_arm_collision_points()
+                    self._arm_q_corr = self._nullspace_correction(
+                        arm_pts, current_proxies
+                    )
+                else:
+                    self._arm_q_corr = None
+
+                # EMA smoothing: blend new raw correction into the smooth signal.
+                # When no links are close (None), decay the smooth signal to zero.
+                raw = self._arm_q_corr if self._arm_q_corr is not None else np.zeros(7)
+                alpha = self.ARM_EMA_ALPHA
+                self._arm_q_corr_smooth = (
+                    alpha * raw + (1.0 - alpha) * self._arm_q_corr_smooth
+                )
+
                 self._draw_velocity_arrow(x_now, current_velocity)
                 self._trace_ee(x_now)
 
@@ -465,14 +786,31 @@ class FrankaStarWorldsDemo:
                 if t - last_report >= report_interval:
                     dist = float(np.linalg.norm(x_now - goal))
                     gammas_str = ""
+                    arm_str = ""
                     if current_proxies and not self.use_raw:
                         gs = [self.controller._gamma(x_now, px)
                               for px in current_proxies]
-                        gammas_str = " | Γ=[" + " ".join(f"{g:.2f}" for g in gs) + "]"
+                        gammas_str = " | Γ_ee=[" + " ".join(f"{g:.2f}" for g in gs) + "]"
+                        # Per-link min Gamma across all capsule samples for each link
+                        arm_pts = self._get_arm_collision_points()
+                        link_labels = [f"L{li}" for li in self.ARM_MONITOR_LINK_INDICES]
+                        # Collect min-gamma per link (each link has len(ARM_CAPSULE_FRACTIONS) samples)
+                        n_fracs = len(self.ARM_CAPSULE_FRACTIONS)
+                        arm_gs = []
+                        for k in range(len(self.ARM_MONITOR_LINK_INDICES)):
+                            samples = arm_pts[k * n_fracs : (k + 1) * n_fracs]
+                            g_link = min(
+                                min(self.controller._gamma(wp, px) for px in current_proxies)
+                                for wp, _, _ in samples
+                            )
+                            arm_gs.append(g_link)
+                        arm_str = " | Γ_arm=[" + " ".join(
+                            f"{lbl}:{g:.1f}" for lbl, g in zip(link_labels, arm_gs)
+                        ) + "]"
                     speed = float(np.linalg.norm(current_velocity))
                     print(f"t={t:5.1f}s | EE={np.round(x_now,3)} | "
                           f"dist={dist:.3f} m | v={speed:.3f} m/s | "
-                          f"proxies={len(current_proxies)}{gammas_str}")
+                          f"proxies={len(current_proxies)}{gammas_str}{arm_str}")
                     last_report = t
 
         if not goal_reached and p.isConnected():

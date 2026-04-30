@@ -1,0 +1,120 @@
+Body Collision Avoidance — What Was Done
+=========================================
+
+The Core Problem
+----------------
+The original controller only avoided obstacles for the end-effector point.
+The arm links (elbow, forearm, wrist) would pass straight through obstacles.
+
+
+What Was Built
+-------------
+Null-space projection architecture — the key insight is that a 7-DOF arm has
+4 redundant degrees of freedom when the EE task (position) only consumes 3.
+We can use that null space to repose the arm without moving the EE:
+
+    q_cmd = q_IK + (I - J†J) · Δq_avoid
+
+The null-space projector N = I - J†J ensures J·(N·v) = 0, so the EE tracks
+its target perfectly while Δq_avoid pushes links away from obstacles.
+
+
+Challenges & Fixes
+------------------
+1. Wrong number of joints passed to the Jacobian calculation
+   - Problem:  The robot has 12 joints total (including fixed joints and
+               fingers), but the arm controller only uses 7. Passing all 12
+               caused a size mismatch that crashed the calculation.
+   - Fix:      Pre-filtered the joint list to keep only the 7 movable arm
+               joints and cached that list so it is not recomputed every step.
+
+2. IK kept jumping to very different arm poses each step
+   - Problem:  We told the IK solver to "prefer" the current joint angles as
+               a starting guess, but it treated that as a weak suggestion and
+               often returned a completely different valid solution, making the
+               arm snap around erratically.
+   - Fix:      Forced the IK to start from the current joint angles AND added
+               the obstacle correction on top afterward, so the arm moves as
+               little as possible to reach each target.
+
+3. Limiting each joint separately broke the arm's end-effector position
+   - Problem:  When we capped how much each joint could move individually, the
+               combined motion no longer stayed in the null space — the
+               end-effector started drifting off its intended path.
+   - Fix:      Instead of capping joints one by one, we scale the whole
+               correction vector down uniformly so it stays below a maximum
+               size. This keeps the direction intact and the end-effector on
+               track.
+
+4. Only reacting to the single nearest obstacle — failed in tight spaces
+   - Problem:  When two obstacles were close on either side of a link, the
+               code only pushed away from the closest one and ignored the
+               other, so the arm could still get squeezed through.
+   - Fix:      The arm now adds up push forces from every nearby obstacle at
+               the same time, so being caught between two obstacles produces a
+               stronger combined response.
+
+5. Avoidance triggered too late — links were already touching obstacles
+   - Problem:  The distance measure (Gamma) treated each link as a thin line
+               with no thickness. So "Gamma = 1" (the trigger point) meant the
+               centre of the link was at the obstacle boundary — but the
+               physical link surface had already made contact.
+   - Fix:      Added each link's actual physical radius to the distance
+               calculation, so "Gamma = 1" now correctly means the link
+               surface is just reaching the obstacle boundary.
+
+6. Arm ended up in awkward, contorted poses
+   - Problem:  After being pushed around by obstacles repeatedly, the arm
+               drifted into bent-wrist or flipped-elbow configurations that
+               looked unnatural and were hard to recover from.
+   - Fix:      Added a gentle "home position" pull that constantly nudges the
+               joints back toward a natural resting pose whenever the arm
+               strays too far from it.
+
+7. Arm moved jerkily when getting close to an obstacle
+   - Problem:  The avoidance force switched on suddenly the moment a link got
+               within range, causing a sharp jump in joint motion.
+   - Fix:      Applied a running average (EMA) to the correction signal so the
+               force ramps up and down smoothly instead of switching on/off
+               abruptly.
+
+8. Too slow — each control step was doing redundant work
+   - Problem:  The code was calling PyBullet once per link to get joint
+               positions, once per (link, obstacle) pair to compute distances,
+               and reading joint states twice per step (once for avoidance,
+               once for IK).
+   - Fixes:
+       - Fetch all link positions in a single batch call instead of one
+         per link.
+       - Compute distances to all obstacles at once using numpy array
+         operations instead of looping in Python.
+       - Cache the Jacobian for each link so it is only recalculated when
+         the sample point actually changes.
+       - Read joint states once per step and reuse the result in both the
+         avoidance calculation and the IK call.
+
+
+Current State
+-------------
+- All 9 arm links monitored with 3 capsule sample points each (27 total).
+- Each control step (40 Hz):
+    FK (batched) → gamma for all (point, proxy) pairs (vectorised)
+    → null-space correction (APF + posture) → EMA smooth
+    → IK seeded from q_cur + null-space projection → joint commands.
+- Works well in most scenarios; tight dynamic multi-obstacle corridors are
+  the remaining stress case where the reactive null-space approach hits its
+  geometric limits (a QP whole-body controller would handle those).
+
+
+Key Constants (franka_pybullet_demo.py)
+---------------------------------------
+ARM_MONITOR_LINK_INDICES = [0..8]       # all 9 arm links
+ARM_CAPSULE_FRACTIONS    = [0.0, 0.5, 1.0]
+ARM_LINK_RADII           = {0:0.06, 1:0.06, 2:0.06, 3:0.06,
+                             4:0.05, 5:0.05, 6:0.04, 7:0.03, 8:0.04}
+ARM_GAMMA_THRESHOLD      = 1.6          # surface-relative
+ARM_CORRECTION_GAIN      = 0.30
+ARM_POSTURE_GAIN         = 0.08
+ARM_EMA_ALPHA            = 0.10
+ARM_MAX_NS_NORM          = 0.07
+Q_NOMINAL = [0.0, -0.5, 0.0, -2.0, 0.0, 1.8, 0.785]
