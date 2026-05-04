@@ -663,9 +663,6 @@ class FrankaStarWorldsDemo:
         # the scene before anything starts moving.
         print(f"\nStart : {np.round(start, 3)}")
         print(f"Goal  : {np.round(goal, 3)}")
-        # print("\nPyBullet window is open.  Press Enter to start the simulation...")
-        # input()
-
         # Move arm to start
         print(f"Moving to start position...")
         self._move_to_start(start)
@@ -680,7 +677,7 @@ class FrankaStarWorldsDemo:
 
         print(f"Goal: {np.round(goal, 3)}")
         print(f"dist_to_goal = {np.linalg.norm(goal - start):.3f} m")
-        print("\nStarting reactive control loop.  Close window or Ctrl+C to stop.\n")
+        input("\nArm is at start position.  Frame your recording, then press Enter to begin...\n")
 
         # ── Control state ──────────────────────────────────────────────────────
         x_target = self.get_ee_position().copy()
