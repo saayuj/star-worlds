@@ -1,108 +1,99 @@
-# star-worlds
+# Star-Worlds: Reactive 3D Motion Planning for a Franka Arm
 
-Implementation of **"Creating Star Worlds: Reshaping the Robot Workspace for Online Motion Planning"** — Dahlin & Karayiannidis, *IEEE Transactions on Robotics* 39(5), 2023. [DOI: 10.1109/TRO.2023.3279029](https://doi.org/10.1109/TRO.2023.3279029)
+**MEAM 6230 Final Project — University of Pennsylvania, Spring 2026**  
+Gia D'Costa · Saayuj Deshpande · Samhitha Vedire
 
-MEAM 6230 Final Project — University of Pennsylvania, Spring 2026.
+Implementation of **"Creating Star Worlds: Reshaping the Robot Workspace for Online Motion Planning"** — Dahlin & Karayiannidis, *IEEE Transactions on Robotics* 39(5), 2023. ([DOI](https://doi.org/10.1109/TRO.2023.3279029))
 
 ---
 
-## What it does
+## Overview
 
-Given a set of (possibly intersecting) obstacles and robot/goal positions, Algorithm 2 produces a **disjoint star world**: a set of proxy obstacles that are strictly starshaped, pairwise disjoint, covering the original obstacles, and excluding the robot and goal — properties required for convergence guarantees of reactive motion planners.
+Reactive motion planners based on modulation (Huber et al.) require obstacles to be **disjoint** and **star-shaped**. In cluttered scenes, overlapping inflated obstacles violate this — their competing repulsion vectors can cancel and trap the robot.
 
-This is integrated with a Franka Panda arm in PyBullet using a **modulation-based reactive controller** (Huber et al. 2019/2022): sphere obstacles are modelled as 3-D `Ellipsoid` objects, a disjoint star world is computed in full 3-D EE space at 4 Hz, and the controller continuously modulates a goal-directed velocity to deflect the EE around proxy obstacles at 40 Hz. The arm tracks the resulting velocity commands via IK position control.
+This project extends the Star-Worlds algorithm to **full 3-D end-effector space** for a Franka Panda arm in PyBullet:
+
+1. **Star-World Reshaping (Algorithm 2):** clusters overlapping sphere obstacles into disjoint, strictly starshaped proxy obstacles with a guaranteed kernel point per cluster
+2. **Reactive Controller:** Huber-modulation velocity field computed at 40 Hz using the star-world proxy shapes
+3. **Null-space arm-body avoidance:** APF repulsion projected into the Jacobian null space keeps arm links clear while the EE tracks its modulated path
+4. **PyBullet simulation:** full Franka Panda IK control across six obstacle scenarios
+
+---
+
+## Demo
+
+**▶ [Watch the demo video](https://youtu.be/MY4ZFPl7pGw)**
+
+---
+
+## Results
+
+### 2-D: naive modulation fails vs. star-worlds succeeds
+
+Two overlapping circles form a wall directly on the path. Without star-worlds, the repulsion vectors cancel on the approach axis and all paths collide. With star-worlds, the two circles merge into one proxy with an off-axis kernel — all paths arc around cleanly.
+
+![2D comparison](images/2d.png)
+
+### 3-D: Franka arm navigating with star-world proxies
+
+Green wireframe cages show the actual convex-hull boundary of each star-world proxy. The bright green dot is the kernel center x_{c,i}. The white trail is the EE path.
+
+![3D simulation 1](images/3d_1.png)
+![3D simulation 2](images/3d_2.png)
+
+### Quantitative results (6 PyBullet scenarios)
+
+| Scenario | Raw baseline | Star-Worlds | Notes |
+|---|---|---|---|
+| `test` | ✓ 1.41× | ✓ 5.10× | SW converges at 60 s limit (near-equilibrium) |
+| `overlap` | ✗ | ✓ 6.55× | Raw trapped by cancelling normals; SW merges into one proxy |
+| `simple` | ✓ 1.004× | ✓ 1.07× | Two static spheres merge into one proxy |
+| `moderate` | ✓ 1.01× | ✓ 1.48× | Dynamic obstacles, some clusters merge |
+| `corridor` | ✓ 0.98× | ✗ | Over-merging fills the corridor |
+| `wall` | ✗ | ✓ 1.49× | Three-sphere wall merged into single proxy |
+
+**Star-Worlds: 5/6 (83%) · Raw baseline: 4/6 (67%)** · Star-world update: 0.68–8.70 ms (well within 4 Hz budget)
 
 ---
 
 ## Setup
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install -r requirements.txt
-```
-
 Requires Python ≥ 3.9.
 
----
-
-## Directory structure
-
-```
-star-worlds/
-├── starworlds/
-│   ├── obstacles.py             # Ellipse, ConvexPolygon2D, Polygon2D, Ellipsoid
-│   ├── geometry.py              # 2-D: tangent points, cone polygons, polygon clipping (SAT)
-│   ├── geometry_3d.py           # 3-D: convex hull, point-in-hull, tetrahedron kernel
-│   ├── admissible_kernel.py     # ad ker(A, X̄)  — Eq. (6)–(9), §IV-A
-│   ├── starshaped_hull.py       # SH_kerK(A)    — Eq. (11), Property 4d  (2-D and 3-D)
-│   ├── kernel_selection.py      # Algorithm 3   — kernel point selection (2-D and 3-D)
-│   ├── star_world.py            # Algorithm 2   — main pipeline (2-D and 3-D)
-│   ├── integration.py           # StarWorldUpdater — stateful wrapper, auto-detects 2-D/3-D
-│   ├── reactive_controller.py   # Modulation-based reactive controller (Huber et al.)
-│   └── rrt_planner.py           # RRT / RRT*    — works in both 2-D and 3-D (kept for reference)
-├── examples/
-│   ├── 2d_static.py             # Star-world construction visualisation (3 ellipses)
-│   ├── 2d_dynamic.py            # Animated moving obstacles (2-D)
-│   ├── franka_pybullet_demo.py  # Full 3-D Franka + PyBullet reactive control demo
-│   └── obstacle_scenarios.py    # Scenario definitions (test / simple / moderate / corridor)
-├── tests/
-│   ├── test_geometry.py
-│   ├── test_admissible_kernel.py
-│   ├── test_hull.py
-│   └── test_star_world.py
-└── requirements.txt
+```bash
+git clone https://github.com/saayuj/star-worlds
+cd star-worlds
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ---
 
 ## Running the demos
 
-### Franka arm — 3-D PyBullet demo
+### Franka arm — 3-D PyBullet
 
 ```bash
-python examples/franka_pybullet_demo.py                          # default: test scenario
+python examples/franka_pybullet_demo.py                           # test scenario (default)
 python examples/franka_pybullet_demo.py --scenario simple
 python examples/franka_pybullet_demo.py --scenario moderate
 python examples/franka_pybullet_demo.py --scenario corridor
+python examples/franka_pybullet_demo.py --scenario wall
 python examples/franka_pybullet_demo.py --scenario overlap        # star-worlds ON
-python examples/franka_pybullet_demo.py --scenario overlap --raw  # naive baseline (no star-worlds)
-python examples/franka_pybullet_demo.py --no-gui --scenario test  # headless
+python examples/franka_pybullet_demo.py --scenario overlap --raw  # naive baseline
 ```
 
-Each run:
-1. Opens the PyBullet GUI and loads the Franka Panda with sphere obstacles (visual-only — no physics collision, so the arm passes through freely and EE trajectory reflects the algorithm purely)
-2. Pauses — **press Enter in the terminal** to start the simulation
-3. Moves the arm to the start position via IK
-4. Enters the reactive control loop:
-   - **40 Hz**: reads current EE position, computes modulated velocity from star-world proxies, advances IK target
-   - **4 Hz**: rebuilds the disjoint star world from current obstacle positions (supports dynamic obstacles)
-   - **1 Hz**: redraws proxy wireframe (decoupled from control to keep the loop responsive)
-5. Reports goal distance and Gamma values in the terminal every second; stays open until goal is reached, then until you close the window or press Ctrl+C
+Press **Enter** in the terminal once the window opens to start the simulation.
 
-GUI overlays:
-- **Bright green dot**: kernel center x_{c,i} of each proxy
-- **Green wireframe cage**: actual 3-D convex hull boundary of the star-shaped proxy (one cage per merged cluster — shows the true capsule/lens shape, not a sphere approximation)
-- **Orange arrow**: current EE velocity direction
-- **White trail**: EE path traced so far
-- **Green/red dots**: start and goal markers
+**GUI overlays:** green wireframe = star-world proxy hull · green dot = kernel center · orange arrow = EE velocity · white trail = EE path
 
-| Scenario | Obstacles | Notes |
-|---|---|---|
-| `test` | 1 static | Minimal sanity check — single sphere on direct path |
-| `simple` | 4 (2 moving, 2 small static) | Two small static spheres merge into one star-world proxy; 2 dynamic obstacles have independent proxies |
-| `moderate` | 6 (5 moving, 1 static) | Medium — some clusters may merge |
-| `corridor` | 7 (6 static walls + 1 moving blocker) | Arm navigates narrow passage |
-| `overlap` | 2 static (overlapping) | **Before/after comparison**: `--raw` shows naive failure (arm penetrates), default shows star-worlds success (arm arcs around merged proxy) |
-
-### 2-D visualisation examples
+### 2-D visualisations
 
 ```bash
-python examples/2d_static.py          # before/after star-world construction
-python examples/2d_dynamic.py         # animated moving obstacles
-python examples/2d_dynamic.py --save  # save as dynamic_result.gif
-python examples/2d_comparison.py      # side-by-side: naive failure vs star-worlds success → 2d_comparison.png
+python examples/2d_comparison.py   # naive failure vs. star-worlds — saves 2d_comparison.png
+python examples/2d_static.py       # star-world construction for 3 ellipses
+python examples/2d_dynamic.py      # animated moving obstacles
 ```
 
 ---
@@ -110,78 +101,35 @@ python examples/2d_comparison.py      # side-by-side: naive failure vs star-worl
 ## Tests
 
 ```bash
-pytest tests/ -v        # 51 tests, ~2 s
+pytest tests/ -v    # 51 tests, ~2 s
 ```
 
 ---
 
-## API quick-start
+## Repository structure
 
-### 3-D reactive control (Ellipsoid obstacles — Franka / PyBullet)
-
-```python
-from starworlds import StarWorldUpdater, Ellipsoid, ReactiveController
-import numpy as np
-
-updater    = StarWorldUpdater(n_approx_3d=16)
-controller = ReactiveController(v_max=0.30, eta=1.0, safety_radius=0.03)
-
-# Each sphere → Ellipsoid(center, Q=r²·I₃)
-obstacles = [Ellipsoid(center=pos, Q=(r**2)*np.eye(3)) for pos, r in sphere_data]
-
-# Rebuild star world (call at ~4 Hz)
-result = updater.update(obstacles=obstacles,
-                        robot_pos=ee_pos, goal_pos=goal_pos)
-
-# Compute velocity (call at ~40 Hz, using cached result.proxies between rebuilds)
-velocity = controller.compute_velocity(x=ee_pos, xg=goal_pos,
-                                       proxies=result.proxies)
-# velocity is a (3,) vector, ||velocity|| ≤ v_max
 ```
-
-### 2-D (Ellipse / ConvexPolygon2D obstacles)
-
-```python
-from starworlds import StarWorldUpdater, Ellipse
-
-updater = StarWorldUpdater()
-result = updater.update(obstacles=[Ellipse(center, a, b), ...],
-                        robot_pos=start_2d, goal_pos=goal_2d)
-# result.proxies    → list of ObstacleProxy
-# result.is_disjoint → True if convergence is guaranteed
+starworlds/
+├── obstacles.py          # Ellipse, Ellipsoid obstacle types
+├── geometry.py           # 2-D geometry (tangents, cone polygons, clipping)
+├── geometry_3d.py        # 3-D geometry (convex hull, tetrahedron kernel)
+├── admissible_kernel.py  # Admissible kernel — Eq. (6)–(9)
+├── starshaped_hull.py    # Starshaped hull — Eq. (11), 2-D and 3-D
+├── kernel_selection.py   # Algorithm 3 — kernel point selection
+├── star_world.py         # Algorithm 2 — main pipeline
+├── integration.py        # StarWorldUpdater (auto-detects 2-D/3-D)
+└── reactive_controller.py # Huber modulation controller
+examples/
+├── franka_pybullet_demo.py  # Full 3-D Franka + PyBullet demo
+├── obstacle_scenarios.py    # Scenario definitions
+├── 2d_comparison.py         # Before/after 2-D figure
+└── 2d_static.py / 2d_dynamic.py
 ```
-
-`StarWorldUpdater` auto-detects dimensionality from `obstacle.dim` and routes to the 2-D or 3-D algorithm automatically.
 
 ---
 
-## Reactive controller
+## References
 
-`ReactiveController` implements the modulation-based obstacle avoidance from Huber, Billard & Slotine (IEEE RA-L 2019) and Huber, Slotine & Billard (IEEE Trans. Robot. 2022), connected to the star-world proxy shapes.
-
-For each proxy O'_i with kernel center x_{c,i}:
-
-| Quantity | Formula |
-|---|---|
-| Gamma (normalised distance) | Γ_i = ‖x − x_{c,i}‖ / r_i  (= 1 on boundary, > 1 outside) |
-| Outward normal | n_i = (x − x_{c,i}) / ‖…‖ |
-| Normal eigenvalue | λ_n = 1 − η/Γ_i  →  0 at boundary (blocks penetration) |
-| Tangent eigenvalue | λ_t = 1 + η/Γ_i  →  amplified (slides around obstacle) |
-| Modulation matrix | M_i = E_i · diag(λ_n, λ_t, λ_t) · E_iᵀ |
-| Combined velocity | ẋ = M(x) f₀ / ‖M(x) f₀‖ · v_max |
-
-The connection to star-worlds: x_{c,i} ∈ int ker(O'_i) is the kernel center guaranteed by Algorithm 2, which is exactly the repulsion center the modulation needs.
-
----
-
-## Algorithm overview
-
-| Step | Description | Paper ref |
-|------|-------------|-----------|
-| Admissible kernel | Cone polygon (2-D) or cluster hull (3-D) per obstacle | §IV-A, Eq. (8) |
-| Kernel selection | Equilateral triangle K (2-D) or tetrahedron K (3-D) at cluster centroid | Algorithm 3, §V-C |
-| Starshaped hull | `SH_kerK(cluster) = CH(obstacle_surface ∪ K)` | Eq. (11), §IV-B |
-| Re-clustering | Union-find merge of intersecting proxy pairs | Algorithm 2, §V-A.3 |
-| Fallback | Convex decomposition if AK is empty | Eq. (14) |
-
-Typical convergence: **1–2 iterations** for well-separated obstacles.
+- Dahlin & Karayiannidis, "Creating Star Worlds," *IEEE T-RO* 39(5), 2023
+- Huber, Billard & Slotine, "Avoidance of Convex and Concave Obstacles," *IEEE RA-L* 4(2), 2019
+- Huber, Slotine & Billard, "Avoiding Dense and Dynamic Obstacles," *IEEE T-RO* 38(5), 2022
