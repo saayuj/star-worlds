@@ -254,3 +254,188 @@ def _ch_inside_polygon(K: np.ndarray, polygon: np.ndarray) -> bool:
         if not polygon_contains_point(polygon, pt):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# 3-D admissible-kernel selection (revision 2)
+# ---------------------------------------------------------------------------
+
+def _obs_center_radius(obs):
+    """Center and bounding radius of an obstacle (Ellipsoid or ConvexShape3D)."""
+    c = np.asarray(obs.center, dtype=float)
+    if hasattr(obs, "bounding_radius"):
+        return c, float(obs.bounding_radius())
+    # Ellipsoid: largest semi-axis
+    return c, float(np.sqrt(np.max(np.linalg.eigvalsh(obs.Q))))
+
+
+def _obs_signed_distance(obs, k):
+    if hasattr(obs, "signed_distance"):
+        return float(obs.signed_distance(k)[0])
+    c, r = _obs_center_radius(obs)
+    return float(np.linalg.norm(np.asarray(k) - c) - r)
+
+
+def _obs_hull_equations(obs, n: int = 48):
+    """Half-space description (A, b) of the polytope approximation of obs
+    (cached on the obstacle object)."""
+    cached = getattr(obs, "_hull_eq_cache", None)
+    if cached is not None:
+        return cached
+    from scipy.spatial import ConvexHull
+    h = ConvexHull(np.asarray(obs.polygon_approximation(n=n), dtype=float))
+    out = (h.equations[:, :3], h.equations[:, 3])
+    try:
+        obs._hull_eq_cache = out
+    except Exception:
+        pass
+    return out
+
+
+def admissible_wrt(k, e, c, R):
+    """
+    True if point k is in the admissible kernel ad ker(O, {e}) for an
+    obstacle bounded by the ball B(c, R) (Eq. (8) of Dahlin & Karayiannidis
+    in 3-D): e must not lie in CH(O ∪ {k}).  This fails exactly when k lies
+    in the cone with apex e, axis (e − c) and half-angle asin(R/|e − c|).
+    Using the bounding ball is exact for spheres and conservative otherwise.
+    """
+    v = e - c
+    dist = float(np.linalg.norm(v))
+    if dist <= R:            # e inside the bounding ball: cannot certify
+        return False
+    w = k - e
+    wn = float(np.linalg.norm(w))
+    if wn < 1e-9:
+        return False
+    cos_ang = float(w @ v) / (wn * dist)
+    cos_half = np.sqrt(max(1.0 - (R / dist) ** 2, 0.0))
+    return cos_ang < cos_half - 1e-9
+
+
+def select_kernel_3d_admissible(
+    cl_obs: list,
+    x: np.ndarray,
+    xg: np.ndarray,
+    k_prev_centroid: Optional[np.ndarray] = None,
+    eps: float = 0.008,
+    min_line_dist: float = 0.01,
+    n_random: int = 80,
+    reach_center: Optional[np.ndarray] = None,
+    reach_radius: float = 0.72,
+    z_min: float = 0.22,
+    forbid_dir: Optional[np.ndarray] = None,
+):
+    """
+    3-D analogue of Algorithm 3: choose a kernel tetrahedron K whose
+    vertices all lie in  ad ker(O_C, {x, x_g}) = ∩_i ∩_{e∈{x,xg}} ad ker(O_i,{e})
+    (Eq. (6)–(9)) while keeping the starshaped hull SH_K(O_C) tight.
+
+    Candidates: obstacle centres, pairwise centre interpolations, the
+    previous kernel centroid (temporal coherence) and deterministic random
+    samples in the cluster's bounding box.  Each admissible candidate is
+    scored by the hull growth Σ_i max(0, sd_i(k)) (zero when k lies in every
+    obstacle), a preference for deep interior points, distance to the
+    previous kernel (temporal coherence) and must keep a minimum distance
+    from the segment line l(x, x_g) so that the reference point does not
+    create a saddle on the straight-line path.
+
+    Workspace-aware side selection (revision): with a reference point
+    offset o from l(x, x_g), the modulated flow circumvents the cluster on
+    the side −o.  If *reach_center* is given, candidates whose induced
+    detour point leaves the well-conditioned part of the manipulator
+    workspace (farther than *reach_radius* from the shoulder or below
+    *z_min*) are penalised.  *forbid_dir* (set after a detected kinematic
+    deadlock) restricts the kernel to the opposite side, i.e. the robot
+    circumvents the cluster the other way.
+
+    Returns (K, k_c) or (None, None) if the admissible kernel is empty.
+    """
+    x = np.asarray(x, dtype=float)
+    xg = np.asarray(xg, dtype=float)
+    crs = [_obs_center_radius(o) for o in cl_obs]
+    centers = np.array([c for c, _ in crs])
+
+    cands = [centers.mean(axis=0)] + list(centers)
+    for i in range(len(centers)):
+        for j in range(i + 1, len(centers)):
+            for a in (0.25, 0.5, 0.75):
+                cands.append((1 - a) * centers[i] + a * centers[j])
+    if k_prev_centroid is not None:
+        cands.append(np.asarray(k_prev_centroid, dtype=float))
+    lo = np.min([c - r for c, r in crs], axis=0)
+    hi = np.max([c + r for c, r in crs], axis=0)
+    rng = np.random.default_rng(12345)
+    cands.extend(lo + (hi - lo) * rng.random((n_random, 3)))
+    cands = np.asarray(cands)
+
+    l_dir = xg - x
+    l_len = float(np.linalg.norm(l_dir))
+    l_unit = l_dir / l_len if l_len > 1e-10 else np.array([1.0, 0, 0])
+    tet = regular_tetrahedron_3d(np.zeros(3), eps)
+
+    # distance from the infinite line l(x, xg)
+    rel = cands - x
+    r_perp = rel - np.outer(rel @ l_unit, l_unit)
+    ok = np.linalg.norm(r_perp, axis=1) >= min_line_dist
+    pts = (cands[:, None, :] + np.vstack([np.zeros((1, 3)), tet])[None]).reshape(-1, 3)
+    n_pts = 1 + len(tet)
+    for i, obs in enumerate(cl_obs):
+        A, b = _obs_hull_equations(obs)
+        for e in (x, xg):
+            # e ∈ CH(O ∪ {k})  ⇔  the ray e + s (e − k), s ≥ 0, meets O.
+            ae = A @ e + b                         # (F,)
+            if np.all(ae <= 1e-12):                # e inside O: infeasible
+                ok[:] = False
+                break
+            d = e - pts                            # (M,3)
+            ad = d @ A.T                           # (M,F)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                t = -ae[None, :] / ad
+            t_out = np.where(ad > 1e-12, t, np.inf).min(axis=1)
+            t_in = np.where(ad < -1e-12, t, -np.inf).max(axis=1)
+            blocked = np.any((np.abs(ad) <= 1e-12) & (ae[None, :] > 1e-12), axis=1)
+            hit = (~blocked) & (t_in <= t_out) & (t_out >= 0.0)
+            ok &= ~hit.reshape(-1, n_pts).any(axis=1)
+    if forbid_dir is not None and np.any(ok):
+        side = r_perp @ np.asarray(forbid_dir, dtype=float)
+        if np.any(ok & (side < 0)):
+            ok &= side < 0
+    elif k_prev_centroid is not None and np.any(ok):
+        # Algorithm 3 (temporal coherence): keep the previous kernel while it
+        # remains admissible; otherwise stay on the same side of l(x, x_g)
+        # so the circumvention direction never reverses spontaneously.
+        kp = np.asarray(k_prev_centroid, dtype=float)
+        d_prev = np.linalg.norm(cands - kp, axis=1)
+        j = int(np.argmin(d_prev))
+        if d_prev[j] < 1e-9 and ok[j]:
+            return kp + tet, kp
+        rp = (kp - x) - float((kp - x) @ l_unit) * l_unit
+        side = r_perp @ rp
+        if np.any(ok & (side > 0)):
+            ok &= side > 0
+    if not np.any(ok):
+        return None, None
+    good = cands[ok]
+    sds = np.column_stack([
+        obs.signed_distance(good) if hasattr(obs, "signed_distance")
+        else np.linalg.norm(good - crs[i][0], axis=1) - crs[i][1]
+        for i, obs in enumerate(cl_obs)])
+    score = np.sum(np.maximum(sds, 0.0), axis=1) + 0.05 * np.max(sds, axis=1)
+    if k_prev_centroid is not None:
+        score += 0.5 * np.linalg.norm(good - np.asarray(k_prev_centroid), axis=1)
+    if reach_center is not None:
+        cbar = centers.mean(axis=0)
+        R_c = max(r for _, r in crs) + float(np.max(np.linalg.norm(centers - cbar, axis=1)))
+        s_par = float(np.clip((cbar - x) @ l_unit, 0.0, l_len))
+        m = x + s_par * l_unit
+        off = r_perp[ok]
+        o_hat = off / np.maximum(np.linalg.norm(off, axis=1, keepdims=True), 1e-12)
+        w = m - o_hat * (R_c + 0.05)
+        reach = np.linalg.norm(w - np.asarray(reach_center), axis=1)
+        score += 1.0 * np.maximum(reach - reach_radius, 0.0) \
+            + 1.0 * np.maximum(z_min - w[:, 2], 0.0)
+    best = good[int(np.argmin(score))]
+    if best is None:
+        return None, None
+    return best + tet, best

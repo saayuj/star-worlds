@@ -76,7 +76,7 @@ def main():
     draw_robot_goal(ax_l, X_ROBOT, X_GOAL)
     setup_axes(ax_l, XLIM, YLIM,
                title="Before: intersecting obstacles\n"
-                     "(local minima exist at intersection points)")
+                     "(disjointness assumption violated)")
     ax_l.legend(loc="lower right", fontsize=8)
 
     # Right: star world after Algorithm 2
@@ -93,7 +93,7 @@ def main():
     kind = "Disjoint" if result.is_disjoint else "Intersecting (fallback)"
     setup_axes(ax_r, XLIM, YLIM,
                title=f"After: Algorithm 2 ({kind} ★ world)\n"
-                     f"{len(result.proxies)} proxy obstacle(s), convergence guaranteed")
+                     f"{len(result.proxies)} disjoint star-shaped proxy obstacle(s)")
     # Legend handles
     from matplotlib.patches import Patch
     handles = [

@@ -139,16 +139,20 @@ def polygons_intersect_3d(
     pts_a = np.asarray(pts_a, dtype=float)
     pts_b = np.asarray(pts_b, dtype=float)
 
+    # Quick rejection: disjoint axis-aligned bounding boxes
+    if np.any(pts_a.max(axis=0) < pts_b.min(axis=0)) or \
+       np.any(pts_b.max(axis=0) < pts_a.min(axis=0)):
+        return False
+
     _, eq_a = convex_hull_with_equations_3d(pts_a)
     _, eq_b = convex_hull_with_equations_3d(pts_b)
 
     if eq_a is None or eq_b is None:
         return False
 
-    for v in pts_a:
-        if point_in_convex_hull_3d(pts_b, v, equations=eq_b):
-            return True
-    for v in pts_b:
-        if point_in_convex_hull_3d(pts_a, v, equations=eq_a):
-            return True
+    tol = 1e-9
+    if np.any(np.all(pts_a @ eq_b[:, :3].T + eq_b[:, 3] <= tol, axis=1)):
+        return True
+    if np.any(np.all(pts_b @ eq_a[:, :3].T + eq_a[:, 3] <= tol, axis=1)):
+        return True
     return False
