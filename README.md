@@ -78,6 +78,8 @@ Methods: `sw sw_adaptive mod ch cbf apf sw_legacy mod_legacy`. In GUI mode, pres
 
 ## Reproducing the paper (all headless)
 
+The exact version used for the ROBOMECH Journal article is tagged [`robomech-revision`](https://github.com/saayuj/star-worlds/tree/robomech-revision). `--suite all` includes the latency/asynchronous-execution study (`latency`).
+
 ```bash
 python -m experiments.run_experiments --suite all --procs 14   # ~8 000 trials → results/*.jsonl
 python -m experiments.run_experiments --suite noise2

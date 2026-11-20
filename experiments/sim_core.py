@@ -103,6 +103,14 @@ class TrialConfig:
     # (ablation): kernel, ctrl, arm, ws, flip
     ablate: str = ''
     qp_dsafe: float = -1.0           # arm clearance [m]; <0 → QP_DSAFE
+    # Execution model of the world update.  0 (default): synchronous — the
+    # update computed from the poses perceived at time t is used from time t
+    # on (the simulation does not advance while the planner computes).
+    # >0: fixed latency in seconds before the result becomes active.
+    # <0: asynchronous with the MEASURED wall-clock compute time as latency;
+    # no new update starts while one is pending (missed deadlines lower the
+    # effective update rate).
+    latency: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -284,12 +292,16 @@ class FrankaSim:
             shapes.append(o['shape'].moved(c).inflated(cfg.dr))
         # un-inflated shapes at the perceived poses (used by the arm layer,
         # which accounts for the link radii explicitly)
-        self.perceived_true = [sh.inflated(-cfg.dr) for sh in shapes]
+        self.activate_arm_world([sh.inflated(-cfg.dr) for sh in shapes])
+        return shapes
+
+    def activate_arm_world(self, true_shapes):
+        """Make a perceived world available to the arm layer (ghost bodies)."""
+        self.perceived_true = true_shapes
         if hasattr(self, 'ghost_ids'):
-            for g, sh in zip(self.ghost_ids, self.perceived_true):
+            for g, sh in zip(self.ghost_ids, true_shapes):
                 p.resetBasePositionAndOrientation(g, sh.center.tolist(), _matrix_to_quat(sh.R),
                                                   physicsClientId=self.cid)
-        return shapes
 
     def representation(self, shapes, x, xg):
         """Return (proxies_for_modulation, info) for the configured method."""
@@ -597,6 +609,11 @@ class FrankaSim:
         log = {'t': [], 'x': [], 'q': [], 'obs': [], 'v': [], 'proxies': [], 'manip': [],
                'jl': [], 'clip': [], 'gamma_min': []} if cfg.record else None
         step = 0
+        pending = None
+        n_missed = 0
+        t_prev_perc = 0.0
+        trk_err = []
+        v_prev_cmd = None
         while True:
             if cfg.arm_mode == 'ns':
                 self.apply_ik(x_target, None)
@@ -607,14 +624,28 @@ class FrankaSim:
             if cfg.realtime:
                 time.sleep(1.0 / PHYSICS_HZ)
 
-            if step % sw_div == 0:
-                shapes = self.perceive(t)
-                cc = np.array([s.center for s in shapes])
-                vels = (cc - prev_c) / (sw_div / PHYSICS_HZ)
+            if step % sw_div == 0 and pending is None:
+                arm_world = self.perceived_true
+                new_shapes = self.perceive(t)
+                if cfg.latency != 0:
+                    self.activate_arm_world(arm_world)     # keep the old world active
+                cc = np.array([s.center for s in new_shapes])
+                new_vels = (cc - prev_c) / max(t - t_prev_perc, 1e-6)
                 prev_c = cc
+                t_prev_perc = t
                 t0 = time.perf_counter()
-                proxies, info = self.representation(shapes, self.ee(), xg)
-                rep_times.append(time.perf_counter() - t0)
+                new_proxies, new_info = self.representation(new_shapes, self.ee(), xg)
+                dt_comp = time.perf_counter() - t0
+                rep_times.append(dt_comp)
+                delay = cfg.latency if cfg.latency > 0 else (dt_comp if cfg.latency < 0 else 0.0)
+                if delay > sw_div / PHYSICS_HZ:
+                    n_missed += 1
+                pending = (t + delay, new_shapes, new_vels, new_proxies, new_info)
+            if pending is not None and t >= pending[0] - 1e-12:
+                _, shapes, vels, proxies, info = pending
+                pending = None
+                if cfg.latency != 0:
+                    self.activate_arm_world([sh.inflated(-cfg.dr) for sh in shapes])
                 arm_proxies = proxies if cfg.method not in ('cbf', 'apf') else \
                     B.per_obstacle_proxies(shapes, self.n_approx)
                 n_prox.append(len(proxies))
@@ -636,6 +667,8 @@ class FrankaSim:
                                        physicsClientId=self.cid)
                 self._trace_prev = x.copy()
                 ee_speed = float(np.linalg.norm(x - x_prev)) / dt_ctrl
+                if v_prev_cmd is not None:
+                    trk_err.append(float(np.linalg.norm((x - x_prev) / dt_ctrl - v_prev_cmd)))
                 x_prev = x.copy()
                 # safety metrics on TRUE geometry
                 clr = self.min_clearance()
@@ -654,6 +687,7 @@ class FrankaSim:
                 vel_times.append(time.perf_counter() - t0)
                 xt = x + v * dt_ctrl
                 xc = np.clip(xt, WS_LO, WS_HI)
+                v_prev_cmd = (xc - x) / dt_ctrl
                 if np.any(np.abs(xc - xt) > 1e-9):
                     clip_n += 1
                 x_target = xc
@@ -724,6 +758,9 @@ class FrankaSim:
             n_updates=len(cluster_seq),
             stall_frac=stall / max(n_ctrl, 1), clip_frac=clip_n / max(n_ctrl, 1),
             n_flips=n_flips,
+            track_rms=float(np.sqrt(np.mean(np.square(trk_err)))) if trk_err else np.nan,
+            track_p95=float(np.percentile(trk_err, 95)) if trk_err else np.nan,
+            missed_deadlines=n_missed,
             manip_min=manip_min, jl_margin_min=jl_margin_min,
             dynamic=sc.dynamic,
         )
