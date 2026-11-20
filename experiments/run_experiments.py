@@ -57,6 +57,13 @@ def suite_configs(name, n_seeds=N_SEEDS):
                     for s in seeds:
                         C.append(TrialConfig(scenario=sc, method=m, seed=s, noise_std=sd,
                                              qp_dsafe=0.015 + 2 * sd, timeout=180.0))
+    elif name == 'latency':       # E10: execution model / computation latency
+        for sc in ('dynamic', 'moderate', 'corridor', 'simple'):
+            for lat in (0.0, -1.0, 0.1, 0.25, 0.5):
+                for m in ('sw', 'mod'):
+                    for s in seeds:
+                        C.append(TrialConfig(scenario=sc, method=m, seed=s, latency=lat,
+                                             timeout=180.0))
     elif name == 'rates':         # E4: update-rate sensitivity
         for sc in ('moderate', 'corridor', 'dynamic', 'simple'):
             for hz in (1.0, 2.0, 4.0, 10.0, 20.0, 40.0):
@@ -145,6 +152,7 @@ if __name__ == '__main__':
     ap.add_argument('--procs', type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument('--seeds', type=int, default=N_SEEDS)
     a = ap.parse_args()
-    suites = ['main', 'margin', 'noise', 'rates', 'ablation', 'speed', 'timeout'] if a.suite == 'all' else [a.suite]
+    suites = ['main', 'margin', 'noise', 'noise2', 'rates', 'ablation', 'speed', 'timeout',
+                  'latency'] if a.suite == 'all' else [a.suite]
     for s in suites:
         run_suite(s, a.procs, a.seeds)

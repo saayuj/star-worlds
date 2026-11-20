@@ -170,7 +170,11 @@ def tab_scenarios():
              r'$\Delta r=0.05$\,m, perturbs start and goal by $\mathcal{U}(\pm0.03)$\,m per axis '
              r'(rejection-sampled outside the inflated obstacles), obstacle positions by '
              r'$\mathcal{U}(\pm0.015)$\,m, the phase of moving obstacles, and the initial joint '
-             r'configuration by $\mathcal{N}(0,0.25^2)$\,rad around $q_\mathrm{nom}$.}',
+             r'configuration by $\mathcal{N}(0,0.25^2)$\,rad around '
+             r'$q_\mathrm{nom}=(0,-0.5,0,-2.0,0,1.8,0.785)$\,rad. Boxes: half-extents $h$; '
+             r'cylinders: radius and half-height $hh$ (axis along local $z$); $T$: period of '
+             r'the oscillation. The exact definitions are in \texttt{experiments/scenarios.py} '
+             r'of the public repository (tag \texttt{robomech-revision}).}',
              r'\label{tab:scenarios}', r'\scriptsize',
              r'\begin{tabular}{@{}l p{8.2cm} l l@{}}', r'\toprule',
              r'Scenario & Obstacles (shape, centre, size; motion) & Start & Goal \\', r'\midrule']
@@ -187,11 +191,22 @@ def tab_scenarios():
             else:
                 sz = f'r={sh.radius:.3f}, hh={sh.hh:.2f}'
             mv = ''
-            tr = np.array([o['traj'](t) for t in np.linspace(0, 20, 400)])
+            ts = np.linspace(0, 400, 40001)
+            tr = np.array([o['traj'](t) for t in ts])
             if np.ptp(tr, axis=0).max() > 1e-6:
                 amp = np.ptp(tr, axis=0) / 2
-                ax_ = 'xyz'[int(np.argmax(amp))]
-                mv = rf', osc.\ ${ax_}\pm{amp.max():.2f}$'
+                k = int(np.argmax(amp))
+                sig = tr[:, k] - tr[:, k].mean()
+                F = np.abs(np.fft.rfft(sig))
+                fr = np.fft.rfftfreq(len(sig), ts[1] - ts[0])
+                per = 1.0 / fr[1 + int(np.argmax(F[1:]))]
+                axn = 'xyz'[k]
+                mv = rf', osc.\ ${axn}\pm{amp.max():.2f}$, $T={per:.1f}$\,s'
+            if not np.allclose(sh.R, np.eye(3)):
+                from scipy.spatial.transform import Rotation
+                rv = Rotation.from_matrix(sh.R).as_rotvec()
+                ax_ = 'xyz'[int(np.argmax(np.abs(rv)))]
+                sz += rf', rot.\ {np.linalg.norm(rv):.1f}\,rad about ${ax_}$'
             parts.append(f'{sh.kind[0].upper()}{_fmt(c)} {sz}{mv}')
         lines.append(rf'\texttt{{{name}}} & ' + '; '.join(parts) + rf' & {_fmt(spec["start"])} & {_fmt(spec["goal"])} \\')
     lines += [r'\bottomrule', r'\end{tabular}', r'\end{table*}']
@@ -213,7 +228,7 @@ def tab_main(df):
          r'give the number of trials with a collision. Bold: best per row. Last rows: overall '
          r'success with 95\,\% Wilson interval, median time to goal and median path-length ratio '
          r'of successful trials.}',
-         r'\label{tab:main}', r'\small', r'\begin{tabular}{@{}l' + 'c' * len(meths) + '@{}}',
+         r'\label{tab:main}', r'\small', r'\resizebox{\textwidth}{!}{%', r'\begin{tabular}{@{}l' + 'c' * len(meths) + '@{}}',
          r'\toprule', r'Scenario & ' + hdr + r' \\', r'\midrule']
     for sc in SC_ORDER:
         d = df[df.scenario == sc]
@@ -254,7 +269,10 @@ def tab_main(df):
     L.append(r'$p$ vs.\ SW & ' + ' & '.join(pv) + r' \\')
     L.append(r'Median $T$ (s) & ' + ' & '.join(tim) + r' \\')
     L.append(r'Median $L/L_s$ & ' + ' & '.join(rat) + r' \\')
-    L += [r'\bottomrule', r'\end{tabular}', r'\end{table*}']
+    if 'track_rms' in df:
+        trk = [f"{df[df.method == m].track_rms.median():.3f}" for m in meths]
+        L.append(r'Track.\ RMS (m/s) & ' + ' & '.join(trk) + r' \\')
+    L += [r'\bottomrule', r'\end{tabular}}', r'\end{table*}']
     open(os.path.join(TAB, 'main.tex'), 'w').write('\n'.join(L))
 
 
@@ -429,29 +447,41 @@ def fig_timing(tim):
 
 
 def fig_diag():
-    """Near-equilibrium diagnosis: submitted (v1) vs revised pipeline on `single`."""
-    fig, axs = plt.subplots(1, 3, figsize=(7.0, 2.0))
-    for name, m, lab in (('diag_single_legacy', 'sw_legacy', 'SW-v1 (submitted)'),
-                         ('diag_single_sw', 'sw', 'SW (revised)')):
-        f = os.path.join(RES, 'logs', name + '.pkl')
-        if not os.path.exists(f):
-            continue
-        r = pickle.load(open(f, 'rb'))
-        L = r['log']
-        t = np.array(L['t'])
-        X = np.array(L['x'])
-        dist = np.linalg.norm(X - r['goal_pos'], axis=1)
-        axs[0].plot(t, dist, color=COL[m], label=lab)
-        axs[1].plot(t, L['jl'], color=COL[m])
-        axs[2].plot(t, L['manip'], color=COL[m])
-    axs[0].set_ylabel('distance to goal (m)')
-    axs[1].set_ylabel('min. joint-limit margin (rad)')
-    axs[2].set_ylabel(r'manipulability $\sqrt{\det JJ^\top}$')
-    for ax in axs:
-        ax.set_xlabel('time (s)')
+    """Near-equilibrium diagnosis: single (v1 vs revised) and overlap seed 1
+    (revised without vs with workspace-aware kernel + flip)."""
+    rows = [
+        ('single, nominal', [('diag_single_legacy', COL['sw_legacy'], 'SW-v1 (submitted)'),
+                             ('diag_single_sw', COL['sw'], 'SW (revised)')]),
+        ('overlap, seed 1', [('diag_overlap_seed1_noflip', COL['mod'],
+                              'SW without ws-aware side / flip'),
+                             ('diag_overlap_seed1_sw', COL['sw'], 'SW (revised)')]),
+    ]
+    fig, axs = plt.subplots(2, 3, figsize=(7.0, 3.7), sharex='row')
+    for r_i, (title, runs) in enumerate(rows):
+        for name, c, lab in runs:
+            f = os.path.join(RES, 'logs', name + '.pkl')
+            if not os.path.exists(f):
+                continue
+            r = pickle.load(open(f, 'rb'))
+            L = r['log']
+            t = np.array(L['t'])
+            X = np.array(L['x'])
+            axs[r_i, 0].plot(t, np.linalg.norm(X - r['goal_pos'], axis=1), color=c, label=lab)
+            axs[r_i, 1].plot(t, L['jl'], color=c)
+            axs[r_i, 2].plot(t, L['manip'], color=c)
+        axs[r_i, 0].set_ylabel('distance to goal (m)')
+        axs[r_i, 1].set_ylabel('min. joint-limit\nmargin (rad)')
+        axs[r_i, 2].set_ylabel('manipulability')
+        axs[r_i, 0].legend(frameon=False, fontsize=6, title=title, title_fontsize=6.5,
+                           loc='upper right')
+        axs[r_i, 1].axhline(0.05, color='#9a9993', lw=0.8, ls=':')
+        axs[r_i, 1].axhline(0, color='#9a9993', lw=0.8)
+    for ax in axs.flat:
         ax.yaxis.grid(True, color=GRID, lw=0.6)
-    axs[1].axhline(0, color='#9a9993', lw=0.8)
-    axs[0].legend(frameon=False)
+    for ax in axs[1]:
+        ax.set_xlabel('time (s)')
+    for ax in axs[0]:
+        ax.set_xlabel('time (s)')
     fig.tight_layout(pad=0.3)
     fig.savefig(os.path.join(FIG, 'diagnosis.pdf'))
     plt.close(fig)
@@ -524,6 +554,32 @@ def tab_extra(abl, main, tout, path):
         open(os.path.join(TAB, 'path.tex'), 'w').write('\n'.join(L))
 
 
+def tab_latency(df):
+    if df is None:
+        return
+    conds = [(0.0, 'synchronous'), (-1.0, 'async., measured'), (0.1, 'fixed 0.10\\,s'),
+             (0.25, 'fixed 0.25\\,s'), (0.5, 'fixed 0.50\\,s')]
+    L = [r'\begin{table}[t]', r'\centering',
+         r'\caption{Execution model and computation latency (E10; \texttt{dynamic}, '
+         r'\texttt{moderate}, \texttt{corridor}, \texttt{simple}; 80 trials per cell). '
+         r'Success / collision rate (\%), 5th percentile of the minimum robot--obstacle '
+         r'clearance (mm) and median EE velocity tracking error (RMS, m/s).}',
+         r'\label{tab:latency}', r'\resizebox{\columnwidth}{!}{%',
+         r'\begin{tabular}{@{}lcccccc@{}}', r'\toprule',
+         r'Execution & \multicolumn{3}{c}{SW} & \multicolumn{3}{c}{MOD} \\',
+         r' & succ./coll. & clear. & track. & succ./coll. & clear. & track. \\', r'\midrule']
+    for lat, lab in conds:
+        cells = []
+        for m in ('sw', 'mod'):
+            d = df[(df.method == m) & (df.latency == lat)]
+            cells += [f'{100 * d.success.mean():.0f} / {100 * d.collided.mean():.0f}',
+                      f'{1000 * d.min_clearance.quantile(0.05):.0f}',
+                      f'{d.track_rms.median():.3f}']
+        L.append(lab + ' & ' + ' & '.join(cells) + r' \\')
+    L += [r'\bottomrule', r'\end{tabular}}', r'\end{table}']
+    open(os.path.join(TAB, 'latency.tex'), 'w').write('\n'.join(L))
+
+
 def numbers(dfs):
     """Key numbers quoted in the text → tables/numbers.json"""
     out = {}
@@ -551,7 +607,7 @@ def main(which):
         tab_scenarios()
     if which in ('results', 'all'):
         dfs = {k: load(k) for k in ('main', 'margin', 'noise', 'noise2', 'rates', 'ablation', 'speed',
-                                    'timeout')}
+                                    'timeout', 'latency')}
         main_ = dfs['main']
         tab_main(main_)
         fig_main(main_)
@@ -567,6 +623,7 @@ def main(which):
         pf = os.path.join(RES, 'path_analysis.json')
         tab_extra(dfs['ablation'], main_, dfs['timeout'],
                   json.load(open(pf)) if os.path.exists(pf) else None)
+        tab_latency(dfs['latency'])
         numbers(dfs)
 
 
