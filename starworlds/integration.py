@@ -39,7 +39,13 @@ class StarWorldUpdater:
         n_approx: int = 64,
         n_approx_3d: int = 128,
         max_iter: int = 20,
+        kernel_mode: str = "admissible",
+        kernel_kwargs: Optional[dict] = None,
     ):
+        self.kernel_mode = kernel_mode
+        self.kernel_kwargs = kernel_kwargs
+        self._forbid: dict = {}
+        self.n_flips = 0
         self.L = L
         self.n_approx = n_approx
         self.n_approx_3d = n_approx_3d
@@ -97,6 +103,9 @@ class StarWorldUpdater:
                 prev_result = self._prev_result,
                 n_approx    = self.n_approx_3d,
                 max_iter    = self.max_iter,
+                kernel_mode = self.kernel_mode,
+                kernel_kwargs = self.kernel_kwargs,
+                forbid_dirs = self._forbid,
             )
         else:
             result = create_star_world(
@@ -112,9 +121,41 @@ class StarWorldUpdater:
         self._prev_result = result
         return result
 
+    def flip(self, x, xg) -> bool:
+        """
+        Deadlock resolution: force every current cluster's kernel to the
+        opposite side of l(x, x_g), reversing the circumvention direction.
+        Returns True if at least one kernel was flipped.
+        """
+        if self._prev_result is None:
+            return False
+        x = np.asarray(x, float)
+        xg = np.asarray(xg, float)
+        l = xg - x
+        ln = float(np.linalg.norm(l))
+        if ln < 1e-9:
+            return False
+        l = l / ln
+        flipped = False
+        for pr in self._prev_result.proxies:
+            if pr.kernel_K is None:
+                continue
+            o = pr.center_point - x
+            o = o - (o @ l) * l
+            if np.linalg.norm(o) < 1e-6:
+                continue
+            self._forbid[frozenset(pr.original_indices)] = o
+            flipped = True
+        if flipped:
+            self.n_flips += 1
+            # drop temporal coherence so the new side can be selected
+            self._prev_result = None
+        return flipped
+
     def reset(self):
         """Clear temporal-coherence state (call when obstacles change topology)."""
         self._prev_result = None
+        self._forbid = {}
 
     # ---------------------------------------------------------------------- #
     # Convenience: extract per-obstacle info for a motion planner             #

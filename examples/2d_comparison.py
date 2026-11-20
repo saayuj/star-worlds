@@ -370,7 +370,7 @@ def build_figure(save_path, show=True):
             r'kernel $x_{c}$', fontsize=8, color='#BF360C', style='italic')
 
     ax.text(-0.82, -0.57,
-            'Obstacles merged into one starshaped proxy →\nsmooth, consistent field — convergence guaranteed',
+            'Obstacles merged into one starshaped proxy →\none consistent reference point → coherent deflection',
             fontsize=8.2, color='#1B5020',
             bbox=dict(fc='#F3FFF4', ec='#2E7D32', lw=0.8,
                       boxstyle='round,pad=0.4'), zorder=9)

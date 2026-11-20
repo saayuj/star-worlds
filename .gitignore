@@ -10,3 +10,5 @@ build/
 examples/*.png
 examples/*.gif
 
+results/logs/
+results/*_log.txt

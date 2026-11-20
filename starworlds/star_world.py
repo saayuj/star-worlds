@@ -366,9 +366,17 @@ def create_star_world_3d(
     prev_result: Optional["StarWorldResult"] = None,
     n_approx: int = 128,
     max_iter: int = 20,
+    kernel_mode: str = "admissible",
+    kernel_kwargs: Optional[dict] = None,
+    forbid_dirs: Optional[Dict[FrozenSet[int], np.ndarray]] = None,
 ) -> "StarWorldResult":
     """
     3-D version of Algorithm 2 for Ellipsoid obstacles.
+
+    kernel_mode = "admissible" (default, revision 2) selects the kernel in
+    the 3-D admissible kernel ad ker(O_C, {x, x_g}) via
+    select_kernel_3d_admissible; "legacy" reproduces the submitted version
+    (centroid of the cluster hull, nudged off l(x, x_g)).
 
     The admissible kernel region is approximated by the cluster's 3-D convex
     hull (the same robust fallback that the fixed 2-D implementation uses).
@@ -392,7 +400,7 @@ def create_star_world_3d(
         proxy_pieces_intersect_3d,
         center_point_from_kernel_3d,
     )
-    from .kernel_selection import select_kernel_3d
+    from .kernel_selection import select_kernel_3d, select_kernel_3d_admissible
 
     x  = np.asarray(x,  dtype=float)
     xg = np.asarray(xg, dtype=float)
@@ -406,6 +414,9 @@ def create_star_world_3d(
 
     # Each obstacle starts in its own cluster
     clusters: List[FrozenSet[int]] = [frozenset([i]) for i in range(len(obstacles))]
+    # Per-update cache: clusters that survive a re-clustering iteration
+    # unchanged keep their kernel and hull pieces.
+    _cache: Dict[FrozenSet[int], Tuple[list, np.ndarray]] = {}
 
     for _ in range(max_iter):
         proxies_raw: List[Tuple[List[np.ndarray], Optional[np.ndarray], List[int]]] = []
@@ -414,6 +425,10 @@ def create_star_world_3d(
         for cl in clusters:
             cl_list = sorted(cl)
             cl_obs = [obstacles[i] for i in cl_list]
+            if kernel_mode == "admissible" and frozenset(cl) in _cache:
+                pieces, K = _cache[frozenset(cl)]
+                proxies_raw.append((pieces, K, cl_list))
+                continue
 
             # Feasible kernel region = 3-D convex hull of cluster surface pts
             all_surf = np.vstack([obs.polygon_approximation(n=n_approx) for obs in cl_obs])
@@ -427,14 +442,27 @@ def create_star_world_3d(
             # analogue of Algorithm 3 §V-C).  The shift is proportional to
             # the hull's mean radius so the kernel stays near the centroid.
             prev_k = prev_centroids.get(frozenset(cl_list))
-            K, kc = select_kernel_3d(cluster_hull, k_prev_centroid=prev_k,
-                                     x=x, xg=xg)
+            if kernel_mode == "admissible":
+                fd = None
+                if forbid_dirs:
+                    for key, vdir in forbid_dirs.items():
+                        if key & frozenset(cl_list):
+                            fd = vdir
+                            break
+                K, kc = select_kernel_3d_admissible(cl_obs, x, xg,
+                                                    k_prev_centroid=prev_k,
+                                                    forbid_dir=fd,
+                                                    **(kernel_kwargs or {}))
+            else:
+                K, kc = select_kernel_3d(cluster_hull, k_prev_centroid=prev_k,
+                                         x=x, xg=xg)
             if K is None:
                 early_exit = True
                 break
 
             pieces = sh_kernel_cluster_3d(cl_obs, K, n_approx=n_approx)
             proxies_raw.append((pieces, K, cl_list))
+            _cache[frozenset(cl)] = (pieces, K)
 
         if early_exit:
             break
